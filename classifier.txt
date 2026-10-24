@@ -82,10 +82,9 @@ def _earliest_txn_at(incidents: list[Incident]) -> datetime:
     return min(times) if times else datetime.now(timezone.utc)
 
 
-def classify(instrument: Instrument, incidents: list[Incident],
-             sub_category: str = "") -> Classification:
-    """Route a complaint. sub_category is NO LONGER used to pick the channel —
-    an IB-categorised complaint can carry a UPI RRN — so the channel comes from
+def classify(instrument: Instrument, incidents: list[Incident]) -> Classification:
+    """Route a complaint. sub_category is NOT used to pick the channel — an
+    IB-categorised complaint can carry a UPI RRN — so the channel comes from
     the RRN shape and the direction from the layer."""
     mode = instrument.mode_of_payment or ""
 

@@ -149,6 +149,32 @@ Written to `api_response_logs.response_payload` as:
 }
 ```
 
+### Response codes (`status_code` per transaction object)
+
+|Code|Remarks           |When                                                                 |
+|----|------------------|---------------------------------------------------------------------|
+|`00`|                  |success                                                              |
+|`01`|`Record not found`|the gateway answers HTTP 404 for the payer account                   |
+|`12`|`Invalid account number` / `Invalid input`|account is not exactly 12 digits, or an incident lacks amount / date / UTR|
+|`20`|`Invalid RRN`     |UTR/RRN not in the DD enquiry, or no CBDOC row dated like the UTR    |
+|`31`|`Pending`         |an IMPS or ATM debit leg (no beneficiary lookup is possible)         |
+
+Input checks run before any upstream call. If the account and amount are
+present but **both** the transaction date and UTR are missing, only
+`{"acknowledgement_no": ...}` is stored and **no callback is ever sent**.
+
+CBDOC rows found by UTR are kept only when their `OGTMZ1` date equals the date
+embedded in a 22-char NEFT/RTGS UTR (`HSBCN5` + `yyyyMMdd` + serial). Identical
+rows collapse to one; several different rows park the complaint in
+NEEDS_REVIEW rather than picking one.
+
+The callback to MHA is sent at most once per `acknowledgement_no` + `job_id`:
+the `MHA_RESPONSE` step row is claimed atomically before sending. A failed send
+is retried on the next tick (up to `MAX_ATTEMPTS`). If a process dies mid-send
+the outcome is unknown, so it is not re-sent and ends in NEEDS_REVIEW.
+
+Tests: `pip install -r requirements.txt pytest` then `pytest tests`.
+
 ### Every external call is recorded
 
 `processing_steps` logs each call with a `step` type and the response — this is

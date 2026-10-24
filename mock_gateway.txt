@@ -144,7 +144,7 @@ async def upi_secure(payload: dict = Body(...)):
 
 @app.post("/api/v1/search")
 async def search(body: dict = Body(...)):
-    # (a) Ref-only probe (debug endpoint / _cbdoc_probe): echo a sample fraud row.
+    # (a) Ref-only probe (debug endpoint): echo a sample fraud row.
     if body.get("OGTRNO") and not body.get(BQ_FIELD_ACCOUNT):
         row = {"OGTRNO": body["OGTRNO"], "OGBEAC": "9987868786777", "OGBEA1": "MOCK PAYEE",
                "OGT521": "ORDERING ACCT 500021738001", "OGPYAM": 35.00,

@@ -29,6 +29,14 @@ from logger import get_logger
 
 log = get_logger(__name__)
 
+_POOL_KW = dict(
+    pool_size=5,            # permanent connections
+    max_overflow=2,         # temporary extra connections under load
+    pool_timeout=30,        # seconds to wait for a free connection
+    pool_recycle=1800,      # recycle connections older than 30 min
+    pool_pre_ping=True,     # validate before use (survives Cloud Run idle)
+)
+
 _engine: sqlalchemy.engine.base.Engine | None = None
 _SessionLocal: sessionmaker[Session] | None = None
 
@@ -39,11 +47,7 @@ def _create_conn_pool() -> sqlalchemy.engine.base.Engine:
     database_url = os.getenv("DATABASE_URL")
     if database_url:
         log.info("DB: using DATABASE_URL")
-        return sqlalchemy.create_engine(
-            database_url,
-            pool_size=5, max_overflow=2, pool_timeout=30,
-            pool_recycle=1800, pool_pre_ping=True,
-        )
+        return sqlalchemy.create_engine(database_url, **_POOL_KW)
 
     host = config.PG_HOST
     port = config.PG_PORT
@@ -66,15 +70,7 @@ def _create_conn_pool() -> sqlalchemy.engine.base.Engine:
             user=user, password=password, database=db, host=host, port=int(port),
         )
 
-    return sqlalchemy.create_engine(
-        "postgresql+pg8000://",
-        creator=getconn,
-        pool_size=5,            # permanent connections
-        max_overflow=2,         # temporary extra connections under load
-        pool_timeout=30,        # seconds to wait for a free connection
-        pool_recycle=1800,      # recycle connections older than 30 min
-        pool_pre_ping=True,     # validate before use (survives Cloud Run idle)
-    )
+    return sqlalchemy.create_engine("postgresql+pg8000://", creator=getconn, **_POOL_KW)
 
 
 def get_engine() -> sqlalchemy.engine.base.Engine:

@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -48,7 +48,7 @@ from models import (
     ST_AWAITING_CBDOC,
     ST_NEEDS_REVIEW, ST_RECEIVED, ST_RECONCILING, ST_RESOLVED,
     TERMINAL_STATES,
-    ApiResponseLog, Complaint, ComplaintProcessing, Incident, Instrument,
+    ApiResponseLog, ComplaintProcessing, Incident, Instrument,
     ProcessingStep,
 )
 
@@ -218,6 +218,14 @@ def process_batch() -> dict[str, Any]:
     return {"claimed": len(ids), "processed": processed}
 
 
+class AccountNotFound(Exception):
+    """The gateway answered HTTP 404 for the payer account."""
+
+
+class CbdocConflict(Exception):
+    """CBDOC returned several different rows for one UTR; never pick one arbitrarily."""
+
+
 def _process_one(processing_id: int) -> str:
     """Run the state machine for one complaint_processing row. Failures are
     recorded and the row is left for the next tick (until MAX_ATTEMPTS)."""
@@ -226,7 +234,20 @@ def _process_one(processing_id: int) -> str:
             p = s.get(ComplaintProcessing, processing_id)
             if p is None or p.processing_state in TERMINAL_STATES:
                 return p.processing_state if p else "MISSING"
-            _run_state_machine(s, p)
+            try:
+                _run_state_machine(s, p)
+            except AccountNotFound:
+                s.rollback()
+                incidents = p.complaint.instrument.incidents
+                small = [i for i in incidents if _is_small(i)]
+                if small:                   # the rollback may have dropped the stash
+                    _stash_small_txns(s, p, small)
+                _finalize_miscellaneous(s, p, [i for i in incidents if not _is_small(i)],
+                                        "Record not found", MHA_RECORD_NOT_FOUND)
+                _to_review(s, p, "account not found (gateway 404)")
+            except CbdocConflict as e:
+                s.rollback()
+                _to_review(s, p, str(e))
             return p.processing_state
     except Exception as e:                      # noqa: BLE001 - record & defer
         log.exception("processing failed for processing_id=%s: %s", processing_id, e)
@@ -263,6 +284,20 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
         _to_review(s, p, "no instrument/incidents on complaint")
         return
 
+    # Input checks run once, before any upstream call.
+    if p.processing_state == ST_RECEIVED:
+        if _ack_only(instrument, incidents):
+            _write_response_log(s, p, {"acknowledgement_no": p.acknowledgement_no},
+                                response_code=MHA_INVALID_INPUT,
+                                response_message="FAILURE", send=False)
+            _to_review(s, p, "date and UTR missing: acknowledged only, no callback")
+            return
+        problem = _input_problem(instrument, incidents)
+        if problem:
+            _finalize_miscellaneous(s, p, incidents, problem, MHA_INVALID_INPUT)
+            _to_review(s, p, problem)
+            return
+
     # ---- Split by amount -------------------------------------------------
     # Incidents at/below the threshold ALWAYS get "Others Less than equal to
     # 500" (txn_type_id 17) with no lookup/hold. Incidents above it follow the
@@ -289,7 +324,7 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
 
     # Classify on the NORMAL incidents only, so a small layer-0 incident can't
     # drag the whole complaint's direction/channel.
-    cls = classify(instrument, normal, c.sub_category)
+    cls = classify(instrument, normal)
     account = instrument.payer_account_number
     total_disputed = sum((i.disputed_amount for i in normal), Decimal("0"))
 
@@ -342,8 +377,7 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
             # If the UTR wasn't validated, return 'miscellaneous' to MHA.
             if cls.direction == DIR_DEBIT:
                 if not _rrn_validated(s, p, incidents):
-                    _finalize_miscellaneous(s, p, incidents,
-                                            "UTR not found in DD transaction enquiry")
+                    _finalize_miscellaneous(s, p, incidents, "Invalid RRN", MHA_INVALID_RRN)
                     p.processing_state = ST_NEEDS_REVIEW
                     p.last_error = "UTR not validated in DD enquiry (miscellaneous)"
                 else:
@@ -355,8 +389,7 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
             # CREDIT: RRN must have validated in the DD enquiry. If not, return a
             # 'miscellaneous' response to MHA and stop — no balance, no hold.
             if cls.direction == DIR_CREDIT and not _rrn_validated(s, p, incidents):
-                _finalize_miscellaneous(s, p, incidents,
-                                        "RRN not found in DD transaction enquiry")
+                _finalize_miscellaneous(s, p, incidents, "Invalid RRN", MHA_INVALID_RRN)
                 p.processing_state = ST_NEEDS_REVIEW
                 p.last_error = "RRN not validated in DD enquiry (miscellaneous)"
                 p.lease_expires_at = None
@@ -433,6 +466,27 @@ def _to_review(s: Session, p: ComplaintProcessing, reason: str) -> None:
     log.error("[%s] -> NEEDS_REVIEW: %s", p.acknowledgement_no, reason)
 
 
+_ACCOUNT_RE = re.compile(r"[0-9]{12}")   # a string match, so leading zeros survive
+
+
+def _ack_only(instrument: Instrument, incidents: list[Incident]) -> bool:
+    """Account and amount given, but no transaction date and no UTR at all."""
+    return bool((instrument.payer_account_number or "").strip()) and all(
+        inc.amount and not inc.transaction_date and not (inc.merchant_id or "").strip()
+        for inc in incidents)
+
+
+def _input_problem(instrument: Instrument, incidents: list[Incident]) -> Optional[str]:
+    """Why MHA's input can't be processed (-> code 12), or None if it can."""
+    if not _ACCOUNT_RE.fullmatch(instrument.payer_account_number or ""):
+        return "Invalid account number"
+    for inc in incidents:
+        if (inc.amount is None or inc.amount <= 0 or inc.disputed_amount is None
+                or not inc.transaction_date or not (inc.merchant_id or "").strip()):
+            return "Invalid input"
+    return None
+
+
 # ===========================================================================
 # Steps (each cached in processing_steps so repeats don't re-hit upstream)
 # ===========================================================================
@@ -452,11 +506,10 @@ def _step_record(s: Session, p: ComplaintProcessing, step: str, idem: str,
         job_id=p.job_id, step=step, idempotency_key=idem, status=status,
         request_payload=request, response_payload=response,
     )
-    s.add(row)
     try:
-        s.flush()
+        with s.begin_nested():      # a conflict undoes only this insert
+            s.add(row)
     except IntegrityError:          # concurrent insert — reuse existing
-        s.rollback()
         return _step_get(s, p, step, idem)   # type: ignore[return-value]
     return row
 
@@ -510,20 +563,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
 
     # --- CREDIT (any age): validate RRN in the live DD transaction enquiry FIRST ---
     if cls.direction == DIR_CREDIT:
-        from_date = min(i.transaction_date for i in incidents).isoformat()
-        resp = _txn_enquiry(s, p, account, from_date)
-        details = _dig(resp, config.TXN_DETAILS_PATH) or []
-        if not details:
-            # Path yielded nothing — either the real API nests the txn list
-            # elsewhere, or the date filter returned no rows. Self-heal: deep-find
-            # the list, and log the real shape so the path can be corrected.
-            details = _deep_find_txn_list(resp)
-            log.warning("[%s] DD enquiry: 0 txns at TXN_DETAILS_PATH='%s'. "
-                        "deep-find got %d. response keys=%s",
-                        p.acknowledgement_no, config.TXN_DETAILS_PATH,
-                        len(details), _shape(resp))
-        log.info("[%s] DD enquiry returned %d transactions (fromDate=%s)",
-                 p.acknowledgement_no, len(details), from_date)
+        details = _dd_txn_details(s, p, account, incidents)
         for inc in incidents:
             idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
             if _step_get(s, p, "DD_TXN", idem):
@@ -545,17 +585,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
     # --- IB Debit: validate UTR in DD enquiry, then CBDOC (by UTR) for bene.
     #     No hold — like UPI Debit, but bene comes from CBDOC not the UPI API. ---
     if cls.direction == DIR_DEBIT:
-        from_date = min(i.transaction_date for i in incidents).isoformat()
-        resp = _txn_enquiry(s, p, account, from_date)
-        details = _dig(resp, config.TXN_DETAILS_PATH) or []
-        if not details:
-            details = _deep_find_txn_list(resp)
-            log.warning("[%s] DD enquiry: 0 txns at TXN_DETAILS_PATH='%s'. "
-                        "deep-find got %d. response keys=%s",
-                        p.acknowledgement_no, config.TXN_DETAILS_PATH,
-                        len(details), _shape(resp))
-        log.info("[%s] DD enquiry returned %d transactions (fromDate=%s)",
-                 p.acknowledgement_no, len(details), from_date)
+        details = _dd_txn_details(s, p, account, incidents)
         for inc in incidents:
             ddidem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
             if not _step_get(s, p, "DD_TXN", ddidem):
@@ -580,67 +610,35 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                      p.acknowledgement_no, inc.merchant_id, n)
         return
 
-    # --- (unreachable: directions handled above) fallback CBDOC locate ---
-    for inc in incidents:
-        _bq_locate(s, p, account, inc)
+
+def _dd_txn_details(s: Session, p: ComplaintProcessing, account: str,
+                    incidents: list[Incident]) -> list[dict]:
+    """Run (or reuse) the DD transaction enquiry and return its transaction list."""
+    from_date = min(i.transaction_date for i in incidents).isoformat()
+    resp = _txn_enquiry(s, p, account, from_date)
+    details = _dig(resp, config.TXN_DETAILS_PATH) or []
+    if not details:
+        # Path yielded nothing — either the real API nests the txn list
+        # elsewhere, or the date filter returned no rows. Self-heal: deep-find
+        # the list, and log the real shape so the path can be corrected.
+        details = _deep_find_txn_list(resp)
+        log.warning("[%s] DD enquiry: 0 txns at TXN_DETAILS_PATH='%s'. "
+                    "deep-find got %d. response keys=%s",
+                    p.acknowledgement_no, config.TXN_DETAILS_PATH,
+                    len(details), _shape(resp))
+    log.info("[%s] DD enquiry returned %d transactions (fromDate=%s)",
+             p.acknowledgement_no, len(details), from_date)
+    return details
 
 
-def _is_upi_txn(bq_row: dict, inc: Incident) -> bool:
-    """Decide if a CBDOC row represents a UPI transaction.
-    Checks narratives (OGNARx) for 'UPI' keyword or a UPI VPA pattern (x@y).
-    Also checks the incident's merchant_id — UPI RRNs are typically 12 digits.
-    Override by setting UPI_DETECT=false in env to skip this check entirely."""
-    if not config.UPI_DETECT:
-        return False
-
-    # Check CBDOC narrative fields for UPI indicators
-    for field in ("OGNAR1", "OGNAR2", "OGNAR3", "OGNAR4", "OGTMZ1"):
-        val = str(bq_row.get(field) or "").upper()
-        if "UPI" in val:
-            log.info("UPI detected in CBDOC field %s='%s'", field, val)
-            return True
-        # UPI VPA pattern: something@something (e.g. user@oksbi)
-        if "@" in val and len(val.split("@")) == 2:
-            log.info("UPI VPA detected in CBDOC field %s='%s'", field, val)
-            return True
-
-    # 12-digit numeric RRN is a strong UPI indicator
-    rrn = str(inc.merchant_id or "").strip()
-    if rrn.isdigit() and len(rrn) == 12:
-        log.info("12-digit RRN %s suggests UPI transaction", rrn)
-        return True
-
-    return False
-
-
-def _upi_bene_if_required(s: Session, p: ComplaintProcessing, inc: Incident,
-                           account: str) -> None:
-    """Call UPI bene lookup for an IB Debit >24h that was identified as UPI.
-    Idempotent — skipped if already done for this incident."""
-    idem = f"UPI:{p.acknowledgement_no}:{inc.merchant_id}"
-    if _step_get(s, p, "UPI_BENE", idem):
-        log.info("[%s] UPI bene already fetched for RRN=%s (skip)",
-                 p.acknowledgement_no, inc.merchant_id)
-        return
-
-    log.info("[%s] IB Debit >24h: calling UPI API for RRN=%s",
-             p.acknowledgement_no, inc.merchant_id)
-    ts = f"{inc.transaction_date} {inc.transaction_time}"
+def _account_call(call):
+    """Run an account-level gateway call; HTTP 404 means the account doesn't exist."""
     try:
-        resp = gateway().upi_bene_lookup(
-            rrn=inc.merchant_id, account_number=account,
-            amount=str(inc.amount), transaction_timestamp=ts,
-            ack_id=p.acknowledgement_no,
-        )
-        _step_record(s, p, "UPI_BENE", idem, {"rrn": inc.merchant_id}, resp)
-        log.info("[%s] UPI bene fetched for RRN=%s", p.acknowledgement_no, inc.merchant_id)
+        return call()
     except GatewayError as e:
-        # UPI API is "if required" — log but don't fail the whole complaint
-        log.warning("[%s] UPI bene lookup failed for RRN=%s (non-fatal): %s",
-                    p.acknowledgement_no, inc.merchant_id, e)
-        _step_record(s, p, "UPI_BENE", idem,
-                     {"rrn": inc.merchant_id},
-                     {"error": str(e)}, status="FAILURE")
+        if e.status_code == 404:
+            raise AccountNotFound(str(e)) from e
+        raise
 
 
 def _txn_enquiry(s: Session, p: ComplaintProcessing, account: str, from_date: str) -> dict:
@@ -648,7 +646,7 @@ def _txn_enquiry(s: Session, p: ComplaintProcessing, account: str, from_date: st
     existing = _step_get(s, p, "TXN_ENQUIRY", idem)
     if existing and existing.status == "SUCCESS":
         return existing.response_payload or {}
-    resp = gateway().transaction_history(account, from_date=from_date)
+    resp = _account_call(lambda: gateway().transaction_history(account, from_date=from_date))
     _step_record(s, p, "TXN_ENQUIRY", idem,
                  {"account": account, "fromDate": from_date}, resp)
     return resp
@@ -795,25 +793,28 @@ def _rrn_validated(s: Session, p: ComplaintProcessing, incidents: list[Incident]
 
 
 def _finalize_miscellaneous(s: Session, p: ComplaintProcessing,
-                            incidents: list[Incident], reason: str) -> None:
-    """RRN didn't validate in DD enquiry → send a 'miscellaneous' response to MHA,
-    no hold, one object per incident."""
+                            incidents: list[Incident], reason: str, code: str) -> None:
+    """Send MHA a failure response — one `code`/`reason` object per incident, no hold."""
     root = _root_ctx(s, p)
-    txns = [_mha_failure(
+    txns = [_incident_failure(root, inc, code, reason) for inc in incidents]
+    _write_response_log(s, p, {
+        "acknowledgement_no": p.acknowledgement_no,
+        "job_id": p.job_id,
+        "transactions": txns,
+    }, response_code=code, response_message="FAILURE")
+
+
+def _incident_failure(root: dict, inc: Incident, code: str, remarks: str) -> dict:
+    return _mha_failure(
         account=root["root_account_number"],
         rrn=inc.merchant_id,
         bankid=root["root_bankid"],
         amount=str(inc.amount),
         txn_datetime=f"{inc.transaction_date} {inc.transaction_time}",
         disputed=str(inc.disputed_amount),
-        status_code=MHA_RECORD_NOT_FOUND,     # 01 — record not found
-        remarks=reason,
-    ) for inc in incidents]
-    _write_response_log(s, p, {
-        "acknowledgement_no": p.acknowledgement_no,
-        "job_id": p.job_id,
-        "transactions": txns,
-    }, response_code="01", response_message="FAILURE")
+        status_code=code,
+        remarks=remarks,
+    )
 
 
 def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
@@ -822,7 +823,7 @@ def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
     existing = _step_get(s, p, "DD_ENQUIRY", idem)
     if existing and existing.status == "SUCCESS":
         return existing.response_payload or {}
-    resp = gateway().demand_deposit(account)
+    resp = _account_call(lambda: gateway().demand_deposit(account))
     _step_record(s, p, "DD_ENQUIRY", idem, {"account": account}, resp)
     return resp
 
@@ -852,23 +853,6 @@ def _available_balance(s: Session, p: ComplaintProcessing, account: str) -> Deci
         )
     _stash(s, p, "BALANCE", {"value": str(bal)})   # for root_effective_balance
     return bal
-
-
-def _bq_locate(s: Session, p: ComplaintProcessing, account: str, inc: Incident) -> dict:
-    """Find the disputed transaction in CBDOC by account + amount + date + ref."""
-    idem = f"BQ:{p.acknowledgement_no}:{inc.merchant_id}"
-    existing = _step_get(s, p, "BQ_TRACE", idem)
-    if existing and existing.status == "SUCCESS":
-        return existing.response_payload or {}
-    filters = {
-        config.BQ_FIELD_ACCOUNT: account,
-        config.BQ_FIELD_AMOUNT:  float(inc.amount),
-        config.BQ_FIELD_DATE:    int(inc.transaction_date.strftime("%Y%m%d")),
-        config.BQ_FIELD_REF:     inc.merchant_id,
-    }
-    resp = gateway().bigquery_search(filters, limit=100)
-    _step_record(s, p, "BQ_TRACE", idem, filters, resp)
-    return resp
 
 
 # ===========================================================================
@@ -971,6 +955,8 @@ def _scheme_from_narratives(txn: dict) -> Optional[str]:
     for nv in _narratives(txn):
         u = nv.strip().upper()
         for tok in re.split(r"[/\s,;|]+", u):
+            if tok == "ATM":        # exact only, so names like "ATMARAM" don't match
+                return "ATM"
             for scheme in ("IMPS", "UPI", "NEFT", "RTGS"):
                 # bare token, or a token that starts with the scheme (e.g. UPI2026...)
                 if tok == scheme or tok.startswith(scheme):
@@ -1001,7 +987,7 @@ def _classify_rrn(token: str, payer_digits: str,
     if t.isdigit() and len(t) == 12:
         if payer_digits and t in payer_digits:      # payer's own account, not an RRN
             return None
-        if scheme in ("UPI", "IMPS"):
+        if scheme in ("UPI", "IMPS", "ATM"):
             return (t, scheme)                        # scheme tag decides
         return (t, "UPI")                             # no tag -> assume UPI, probe confirms
     return None
@@ -1023,15 +1009,15 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
                   account: str, amount: Decimal, ts_iso: str) -> tuple[dict, str, str]:
     """Fetch bene details for one RRN. Returns (bene, final_type, status).
 
-      IMPS      -> out of scope, no lookup. status='ops_review' (ops adds bene manually).
+      IMPS/ATM  -> out of scope, no lookup. status='ops_review' (MHA gets 31 Pending).
       UPI       -> UPI API. Valid -> status='resolved'. Invalid response means it was
                    actually IMPS -> downgrade type to IMPS, status='ops_review'.
       NEFT/RTGS -> CBDOC by LPUTRN. status='resolved' (empty row -> still resolved,
                    just blank bene).
     status is one of: 'resolved' | 'ops_review'.
     """
-    if rtype == "IMPS":
-        return {}, "IMPS", "ops_review"
+    if rtype in ("IMPS", "ATM"):
+        return {}, rtype, "ops_review"
 
     if rtype == "UPI":
         idem = f"UPI:{p.acknowledgement_no}:{rrn}"
@@ -1067,18 +1053,19 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
             log.warning("[%s] CBDOC bene failed rrn=%s: %s", p.acknowledgement_no, rrn, e)
             return {}, rtype, "resolved"
     rows = _rows(step.response_payload)
-    row = rows[0] if rows else {}
-    if not row:
+    if not rows:
         log.warning("[%s] CBDOC bene: 0 rows searching %s=%s (resp keys=%s)",
                     p.acknowledgement_no, config.BQ_SEARCH_REF_FIELD, rrn,
                     list(step.response_payload.keys()) if isinstance(step.response_payload, dict) else type(step.response_payload).__name__)
         # No CBDOC row yet — caller may retry (CBDOC is T+1 for recent frauds).
         return {}, rtype, "cbdoc_empty"
+    row = _cbdoc_row(rows, rrn)
+    if row is None:
+        log.warning("[%s] CBDOC bene: %d row(s) for %s, none dated like the UTR",
+                    p.acknowledgement_no, len(rows), rrn)
+        return {}, rtype, "invalid_rrn"
     # Beneficiary name = OGBEA1..OGBEA4 lines joined; account = OGBEAC (strip '/').
-    name = " ".join(
-        str(row.get(k, "")).strip() for k in ("OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4")
-        if str(row.get(k, "")).strip()
-    )
+    name = _bene_name(row)
     bene = {
         "account": _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),   # OGBEAC
         "bank": "",                                                          # no bank column in CBDOC
@@ -1119,7 +1106,9 @@ MHA_BANK_CODE = "00"
 # MHA Ack response codes.
 MHA_OK               = "00"   # SUCCESS
 MHA_RECORD_NOT_FOUND = "01"   # Record not found
-MHA_INVALID_RRN      = "02"   # Invalid RRN
+MHA_INVALID_INPUT    = "12"   # Invalid input / account number
+MHA_INVALID_RRN      = "20"   # Invalid RRN (UTR not found)
+MHA_PENDING          = "31"   # Pending (IMPS / ATM)
 
 
 def _mha_money_transfer_to(*, rrn: str, payee_bank: str, payee_bank_code: str,
@@ -1201,13 +1190,12 @@ def _mha_failure(*, account: str, rrn: str, bankid: str, amount: str,
     }
 
 
-# Internal leg state -> (MHA status_code, remarks). An IMPS/unresolved leg is a
-# REAL transfer we simply can't look up, so it is NOT "Invalid RRN" (02); it
-# stays SUCCESS with an explanatory remark for the ops team.
+# Internal leg state -> (MHA status_code, remarks).
 _LEG_STATUS = {
     "resolved":      (MHA_OK, ""),
-    "ops_review":    (MHA_OK, "IMPS - beneficiary pending manual lookup"),
+    "ops_review":    (MHA_PENDING, "Pending"),              # IMPS / ATM
     "cbdoc_pending": (MHA_OK, "Beneficiary details pending"),
+    "invalid_rrn":   (MHA_INVALID_RRN, "Invalid RRN"),
 }
 
 
@@ -1258,7 +1246,7 @@ def _min_incident_utc(incidents: list[Incident]) -> datetime:
 
 def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
                               incidents: list[Incident],
-                              remaining: Decimal) -> tuple[list[dict], bool]:
+                              remaining: Decimal) -> tuple[list[dict], bool, bool]:
     """Reconcile a CREDIT fraud from the DD transaction enquiry.
 
       1. Reuse the DD enquiry transaction list.
@@ -1333,164 +1321,24 @@ def _reconcile_credit_from_dd(s: Session, p: ComplaintProcessing,
     return objs, fully, cbdoc_pending
 
 
-def _trace_and_collect(s: Session, p: ComplaintProcessing, incidents: list[Incident],
-                       remaining: Decimal) -> tuple[list[dict], bool]:
-    """CBDOC reconciliation for a CREDIT fraud.
-
-    Spec:
-      1. Hit CBDOC with the account number.
-      2. Anchor on the fraud transaction_time from the MHA request.
-      3. Collect every DEBIT logged AFTER that time, chronologically.
-      4. Keep collecting until the outstanding `remaining` is reconciled.
-      5. All collected debits are returned to MHA.
-
-    Returns (collected_transactions, fully_reconciled)."""
-    account = p.complaint.instrument.payer_account_number
-
-    rows = _cbdoc_account_debits(s, p, account, incidents)
-    if not rows:
-        _cbdoc_probe(s, p, incidents)
-        log.warning("[%s] CBDOC returned 0 rows for account=%s", p.acknowledgement_no, account)
-        return [], False
-
-    rows = sorted(rows, key=_row_dt)
-    fraud_refs = {inc.merchant_id for inc in incidents}
-
-    # Anchor = fraud transaction time from the MHA request (earliest incident),
-    # compared against each CBDOC row's OGTMZ1 timestamp (both IST).
-    anchor = min((_incident_dt(inc) for inc in incidents), default=datetime.min)
-    log.info("[%s] CBDOC reconcile anchored on MHA fraud time=%s (matching OGTMZ1)",
-             p.acknowledgement_no, anchor.isoformat())
-
-    collected: list[dict] = []
-    recovered = Decimal("0")
-    root = _root_ctx(s, p)
-    disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
-    for row in rows:
-        if _row_dt(row) <= anchor:                 # only txns AFTER the fraud time
-            continue
-        rrn = str(row.get(config.BQ_FIELD_REF, "")).strip()
-        if rrn in fraud_refs:                       # never the fraud txn itself
-            continue
-        if not _is_debit(row):                      # debits only
-            continue
-        amt = _row_amount(row)
-        if amt <= 0:
-            continue
-        bene = _upi_bene_for(s, p, rrn)
-        collected.append(_to_mha_txn(row, root, disputed, bene=bene))
-        recovered += amt
-        if recovered >= remaining:
-            break
-
-    fully = recovered >= remaining
-    log.info("[%s] CBDOC reconcile: total rows=%d after-fraud collected=%d "
-             "recovered=%s remaining=%s reconciled=%s",
-             p.acknowledgement_no, len(rows), len(collected), recovered, remaining, fully)
-    return collected, fully
-
-
-def _is_debit(row: dict) -> bool:
-    """A CBDOC row is a debit (money leaving the account).
-    The OG* table is outgoing payments, so every row is a debit by default.
-    If your CBDOC has an explicit debit/credit indicator or signed amount,
-    set BQ_DEBIT_INDICATOR_FIELD / BQ_DEBIT_INDICATOR_VALUE in config to filter."""
-    field = config.BQ_DEBIT_INDICATOR_FIELD
-    if not field:
-        # No indicator configured: signed-amount heuristic, else treat as debit.
-        raw = row.get(config.BQ_FIELD_AMOUNT)
-        try:
-            # if amounts are signed, negative = debit
-            return Decimal(str(raw)) != 0
-        except Exception:
-            return True
-    return str(row.get(field, "")).strip().upper() == config.BQ_DEBIT_INDICATOR_VALUE.upper()
-
-
-def _cbdoc_account_debits(s: Session, p: ComplaintProcessing, account: str,
-                          incidents: Optional[list[Incident]] = None) -> list[dict]:
-    """Fetch the account's transactions from CBDOC (cached per complaint).
-
-    Per spec: search by account (BQ_FIELD_ACCOUNT) and optionally the fraud date
-    (BQ_FIELD_DATE) so the query returns that day's transactions; the caller then
-    filters to those AFTER the fraud time and accumulates debits until reconciled.
-
-    IMPORTANT: BQ_FIELD_ACCOUNT must be the CBDOC column holding the account whose
-    outgoing debits you want. If the account search returns 0, a probe logs the
-    fraud row's fields so the right column can be identified."""
-    idem = f"CBDOCDEBITS:{p.acknowledgement_no}:{account}:{p.defer_count}"
-    existing = _step_get(s, p, "BQ_TRACE", idem)
-    if existing and existing.status == "SUCCESS":
-        return _rows(existing.response_payload or {})
-
-    filt: dict[str, Any] = {config.BQ_FIELD_ACCOUNT: config.BQ_ACCOUNT_PREFIX + _strip_acct(account)}
-    # Optionally narrow by fraud date (YYYYMMDD) when enabled.
-    if config.CBDOC_FILTER_BY_DATE and incidents:
-        d = min(i.transaction_date for i in incidents)
-        filt[config.BQ_FIELD_DATE] = d.year * 10000 + d.month * 100 + d.day
-
-    log.info("[%s] CBDOC account search filter=%s", p.acknowledgement_no, filt)
-    resp = gateway().bigquery_search(filt, limit=config.CBDOC_MAX_ROWS)
-    rows = _rows(resp)
-    _step_record(s, p, "BQ_TRACE", idem, filt, resp)
-    log.info("[%s] CBDOC account search returned %d rows", p.acknowledgement_no, len(rows))
-    return rows
-
-
-def _cbdoc_probe(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
-    """Diagnostic: when the account search returns nothing, locate the fraud
-    transaction by its reference number and LOG that row's fields. This reveals
-    how CBDOC actually stores the account so you can set BQ_FIELD_ACCOUNT (and
-    the correct account value) — the single mapping this reconciliation needs."""
-    for inc in incidents:
-        try:
-            resp = gateway().bigquery_search({config.BQ_SEARCH_REF_FIELD: inc.merchant_id}, limit=5)
-        except Exception as e:                      # noqa: BLE001
-            log.warning("[%s] CBDOC probe by %s=%s failed: %s",
-                        p.acknowledgement_no, config.BQ_FIELD_REF, inc.merchant_id, e)
-            continue
-        rows = _rows(resp)
-        log.warning("[%s] CBDOC probe %s=%s -> %d rows",
-                    p.acknowledgement_no, config.BQ_FIELD_REF, inc.merchant_id, len(rows))
-        if rows:
-            log.warning("[%s] CBDOC fraud row fields = %s",
-                        p.acknowledgement_no, {k: rows[0].get(k) for k in rows[0]})
-            log.warning("[%s] ACTION: set BQ_FIELD_ACCOUNT to whichever field above holds the "
-                        "account whose debits you want, and make sure the complaint's "
-                        "payer_account_number matches that stored value/format.",
-                        p.acknowledgement_no)
-            return
-    log.warning("[%s] CBDOC probe found nothing even by reference number — confirm the fraud "
-                "ref (incident 'm'=%s) matches CBDOC's %s and that data exists for it.",
-                p.acknowledgement_no,
-                incidents[0].merchant_id if incidents else "?", config.BQ_FIELD_REF)
-
-
 def _rows(bq_resp: Any) -> list[dict]:
     """Extract the CBDOC row list, tolerant of response shape:
       {"rows":[...]}            (gateway direct)
       {"data":{"rows":[...]}}   (data-enveloped)
       [ ... ]                   (bare list)
     """
+    rows: Any = []
     if isinstance(bq_resp, list):
-        return bq_resp
-    if isinstance(bq_resp, dict):
-        if isinstance(bq_resp.get("rows"), list):
-            return bq_resp["rows"]
+        rows = bq_resp
+    elif isinstance(bq_resp, dict):
         data = bq_resp.get("data")
-        if isinstance(data, dict) and isinstance(data.get("rows"), list):
-            return data["rows"]
-        if isinstance(data, list):
-            return data
-    return []
-
-
-def _row_amount(row: dict) -> Decimal:
-    raw = row.get(config.BQ_FIELD_AMOUNT)
-    try:
-        return abs(Decimal(str(raw))) if raw is not None else Decimal("0")
-    except Exception:
-        return Decimal("0")
+        if isinstance(bq_resp.get("rows"), list):
+            rows = bq_resp["rows"]
+        elif isinstance(data, dict) and isinstance(data.get("rows"), list):
+            rows = data["rows"]
+        elif isinstance(data, list):
+            rows = data
+    return [r for r in rows if isinstance(r, dict) and r]   # junk/empty rows never match
 
 
 def _parse_ogtmz1(v: Any) -> Optional[datetime]:
@@ -1505,6 +1353,34 @@ def _parse_ogtmz1(v: Any) -> Optional[datetime]:
         except ValueError:
             continue
     return None
+
+
+def _utr_date(utr: str) -> Optional[str]:
+    """yyyyMMdd embedded in a NEFT/RTGS UTR: HSBCN5 20260609 00034931 -> '20260609'.
+    None for any other shape (16-char UTRs, internal refs, junk)."""
+    t = (utr or "").strip().upper()
+    if len(t) != config.UTR_LENGTH or not t.startswith(("HSBCN", "HSBCR")):
+        return None
+    d = t[6:14]
+    try:
+        datetime.strptime(d, "%Y%m%d")
+    except ValueError:
+        return None
+    return d if d.isdigit() else None
+
+
+def _cbdoc_row(rows: list[dict], utr: str) -> Optional[dict]:
+    """The one CBDOC row for this UTR, or None if no row's OGTMZ1 date matches
+    the UTR's embedded date. Identical rows collapse; distinct ones raise."""
+    want = _utr_date(utr)
+    if want:
+        rows = [r for r in rows
+                if (ts := _parse_ogtmz1(r.get(config.BQ_FIELD_TIMESTAMP)))
+                and ts.strftime("%Y%m%d") == want]
+    unique = list({json.dumps(r, sort_keys=True, default=str): r for r in rows}.values())
+    if len(unique) > 1:
+        raise CbdocConflict(f"CBDOC returned {len(unique)} different rows for UTR {utr}")
+    return unique[0] if unique else None
 
 
 def _row_dt(row: dict) -> datetime:
@@ -1555,6 +1431,14 @@ def _incident_dt(inc: Incident) -> datetime:
         return datetime.min
     return datetime(d.year, d.month, d.day,
                     t.hour if t else 0, t.minute if t else 0, t.second if t else 0)
+
+
+def _bene_name(row: dict) -> str:
+    """Beneficiary name = CBDOC OGBEA1..OGBEA4 lines joined."""
+    return " ".join(
+        str(row.get(k, "")).strip() for k in ("OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4")
+        if str(row.get(k, "")).strip()
+    )
 
 
 def _strip_acct(v: Any) -> str:
@@ -1667,47 +1551,6 @@ def _fmt_upi_date(raw: str) -> str:
     return t.replace("/", "-")          # best effort
 
 
-def _upi_bene_for(s: Session, p: ComplaintProcessing, rrn: str) -> dict:
-    """Return normalised UPI bene data for this RRN if it was fetched, else {}."""
-    step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{rrn}")
-    if step and step.status == "SUCCESS" and step.response_payload:
-        return _normalise_bene(_dig(step.response_payload, "data") or step.response_payload or {})
-    return {}
-
-
-def _to_mha_txn(row: dict, root: dict, disputed: Decimal,
-                bene: Optional[dict] = None) -> dict:
-    """A CBDOC debit leg → MHA 'Money Transfer To' object (txn_type_id 3).
-    If UPI bene details were fetched (IB Debit >24h UPI path), they fill in
-    payee_bank / payee_account_number / ifsc_code."""
-    bene = bene or {}
-    return _mha_money_transfer_to(
-        rrn=row.get(config.BQ_FIELD_REF, ""),
-        payee_bank=bene.get("bank", ""),
-        payee_bank_code=bene.get("bankCode", ""),
-        payee_account=bene.get("account") or _strip_acct(row.get(config.BQ_FIELD_BENE_ACCOUNT, "")),
-        amount=str(row.get(config.BQ_FIELD_AMOUNT, "")),
-        txn_datetime=_fmt_row_dt(row),
-        disputed=str(disputed),
-        root_account=root["root_account_number"],
-        root_bankid=root["root_bankid"],
-        effective_balance=root["root_effective_balance"],
-        remarks=row.get("OGNAR1", "") or "",
-    )
-
-
-def _fmt_dt(d: Any, t: Any) -> Optional[str]:
-    if d is None:
-        return None
-    ds = str(d)
-    ts = str(t).zfill(6) if t is not None else "000000"
-    try:
-        return (f"{ds[0:4]}-{ds[4:6]}-{ds[6:8]} "
-                f"{ts[0:2]}:{ts[2:4]}:{ts[4:6]}")
-    except Exception:
-        return ds
-
-
 # ===========================================================================
 # Finalise — write the MHA-facing response row
 # ===========================================================================
@@ -1766,11 +1609,11 @@ def _finalize_cbdoc_bene(s: Session, p: ComplaintProcessing, incidents: list[Inc
     for inc in incidents:
         step = _step_get(s, p, "CBDOC_BENE", f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}")
         rows = _rows(step.response_payload) if step and step.response_payload else []
-        row = rows[0] if rows else {}
-        name = " ".join(
-            str(row.get(k, "")).strip() for k in ("OGBEA1", "OGBEA2", "OGBEA3", "OGBEA4")
-            if str(row.get(k, "")).strip()
-        )
+        row = _cbdoc_row(rows, inc.merchant_id) if rows else {}
+        if row is None:
+            txns.append(_incident_failure(root, inc, MHA_INVALID_RRN, "Invalid RRN"))
+            continue
+        name = _bene_name(row)
         txns.append(_mha_money_transfer_to(
             rrn=inc.merchant_id,
             payee_bank=name,                 # CBDOC OGBEA1-4 = beneficiary name
@@ -1856,7 +1699,7 @@ def _finalize_dd_probe(s: Session, p: ComplaintProcessing, instrument: Instrumen
                        incidents: list[Incident]) -> None:
     """Fallback for RRNs whose shape matches neither UPI (12-digit) nor IB
     (16/22-char). Runs ONE DD transaction enquiry; if the RRN is found, returns
-    that transaction's data. Otherwise responds 'record not found'."""
+    that transaction's data. Otherwise responds 'Invalid RRN'."""
     account = instrument.payer_account_number
     from_date = min(i.transaction_date for i in incidents).isoformat()
     root = _root_ctx(s, p)
@@ -1865,7 +1708,8 @@ def _finalize_dd_probe(s: Session, p: ComplaintProcessing, instrument: Instrumen
         resp = _txn_enquiry(s, p, account, from_date)
     except GatewayError as e:
         log.error("[%s] DD probe failed: %s", p.acknowledgement_no, e)
-        _finalize_miscellaneous(s, p, incidents, f"DD enquiry failed: {e}")
+        _finalize_miscellaneous(s, p, incidents, f"DD enquiry failed: {e}",
+                                MHA_RECORD_NOT_FOUND)
         return
 
     details = _dig(resp, config.TXN_DETAILS_PATH) or _deep_find_txn_list(resp)
@@ -1874,12 +1718,7 @@ def _finalize_dd_probe(s: Session, p: ComplaintProcessing, instrument: Instrumen
         found = _find_txn_by_rrn(details, inc.merchant_id)
         if not found:
             log.info("[%s] DD probe: rrn=%s not found", p.acknowledgement_no, inc.merchant_id)
-            txns.append(_mha_failure(
-                account=root["root_account_number"], rrn=inc.merchant_id,
-                bankid=root["root_bankid"], amount=str(inc.amount),
-                txn_datetime=f"{inc.transaction_date} {inc.transaction_time}",
-                disputed=str(inc.disputed_amount),
-                status_code=MHA_RECORD_NOT_FOUND, remarks="Record not found"))
+            txns.append(_incident_failure(root, inc, MHA_INVALID_RRN, "Invalid RRN"))
             continue
 
         log.info("[%s] DD probe: rrn=%s FOUND in DD enquiry",
@@ -1908,7 +1747,6 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
     """UPI-debit: one 'Money Transfer To' per incident, populated from the UPI
     beneficiary lookup."""
     root = _root_ctx(s, p)
-    disputed = sum((i.disputed_amount for i in incidents), Decimal("0"))
     txns = []
     for inc in incidents:
         step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{inc.merchant_id}")
@@ -1938,7 +1776,7 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
 
 def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict,
                         response_code: str = "00",
-                        response_message: str = "SUCCESS") -> None:
+                        response_message: str = "SUCCESS", send: bool = True) -> None:
     # Any <=500 incidents ride along in the same response as the larger ones.
     small = (_unstash(s, p, "SMALL_TXNS") or {}).get("objs") or []
     if small:
@@ -1965,7 +1803,8 @@ def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict,
 
     # Encrypt and send the final response to MHA (via the gateway). Every
     # finalizer funnels through here, so all paths send consistently.
-    _send_mha_response(s, p, payload)
+    if send:
+        _send_mha_response(s, p, payload)
 
 
 _JOB_ID_RE = re.compile(r"BANKS-[0-9a-fA-F-]{8,}")
@@ -2042,9 +1881,14 @@ def _store_mha_ack(s: Session, p: ComplaintProcessing, res: Any) -> None:
 
 def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> None:
     """Encrypt the response payload and POST it to the gateway's MHA-response
-    endpoint. Idempotent (skips if already sent) and non-fatal: a send failure
-    is logged and recorded, not raised, so the complaint isn't reprocessed just
-    because the downstream call hiccuped. Retry is handled separately."""
+    endpoint — at most once per (acknowledgement_no, job_id).
+
+    The MHA_RESPONSE step row is the lock: a worker must atomically create it
+    (or flip it FAILURE -> PENDING) and commit BEFORE sending. A concurrent or
+    retried worker that loses that race never sends. A failed send is recorded
+    as FAILURE and raised, so the normal retry (attempt_count -> NEEDS_REVIEW)
+    re-sends it. A crash mid-send leaves PENDING: the outcome is unknown, so it
+    is never re-sent automatically (at-most-once) and ends in NEEDS_REVIEW."""
     idem = f"MHARESP:{p.acknowledgement_no}:{p.job_id}"
     prior = _step_get(s, p, "MHA_RESPONSE", idem)
     if prior and prior.status == "SUCCESS":
@@ -2055,22 +1899,50 @@ def _send_mha_response(s: Session, p: ComplaintProcessing, payload: dict) -> Non
                     p.acknowledgement_no)
         return
 
-    try:
-        encrypted = encryption.encrypt_payload(payload)
-    except Exception as e:                       # noqa: BLE001
-        log.error("[%s] MHA response encryption failed: %s", p.acknowledgement_no, e)
-        _step_record(s, p, "MHA_RESPONSE", idem, {"acknowledgement_no": p.acknowledgement_no},
-                     {"error": f"encrypt: {e}"}, status="FAILURE")
-        return
+    encrypted = encryption.encrypt_payload(payload)   # raises -> retried, nothing claimed
+
+    step = _claim_mha_send(s, p, idem)
+    if step is None:
+        cur = _step_get(s, p, "MHA_RESPONSE", idem)
+        if cur:
+            s.refresh(cur)                       # another worker may have just finished
+        if cur and cur.status == "SUCCESS":
+            return
+        raise RuntimeError("MHA response is being sent by another worker, or an "
+                           "earlier send's outcome is unknown")
 
     try:
         res = gateway().mha_response(encrypted)
-        _step_record(s, p, "MHA_RESPONSE", idem,
-                     {"acknowledgement_no": p.acknowledgement_no}, res)
-        log.info("[%s] MHA response sent OK", p.acknowledgement_no)
-        _store_mha_ack(s, p, res)
     except GatewayError as e:
-        log.error("[%s] MHA response send failed (non-fatal): %s", p.acknowledgement_no, e)
-        _step_record(s, p, "MHA_RESPONSE", idem,
-                     {"acknowledgement_no": p.acknowledgement_no},
-                     {"error": str(e)}, status="FAILURE")
+        log.error("[%s] MHA response send failed (will retry): %s", p.acknowledgement_no, e)
+        step.status, step.response_payload = "FAILURE", {"error": str(e)}
+        s.commit()
+        raise
+    step.status, step.response_payload = "SUCCESS", res
+    s.commit()                                   # record delivery before anything else
+    log.info("[%s] MHA response sent OK", p.acknowledgement_no)
+    _store_mha_ack(s, p, res)
+
+
+def _claim_mha_send(s: Session, p: ComplaintProcessing,
+                    idem: str) -> Optional[ProcessingStep]:
+    """Atomically take the right to send; returns the PENDING row we now own, or
+    None. The UNIQUE idempotency_key settles a first-send race; the conditional
+    UPDATE settles a retry race."""
+    step: Optional[ProcessingStep] = ProcessingStep(
+        complaint_id=p.complaint_id, acknowledgement_no=p.acknowledgement_no,
+        job_id=p.job_id, step="MHA_RESPONSE", idempotency_key=idem, status="PENDING",
+        request_payload={"acknowledgement_no": p.acknowledgement_no}, response_payload={},
+    )
+    try:
+        with s.begin_nested():
+            s.add(step)
+    except IntegrityError:
+        retaken = s.execute(
+            update(ProcessingStep)
+            .where(ProcessingStep.idempotency_key == idem, ProcessingStep.status == "FAILURE")
+            .values(status="PENDING", attempt=ProcessingStep.attempt + 1)
+        ).rowcount == 1
+        step = _step_get(s, p, "MHA_RESPONSE", idem) if retaken else None
+    s.commit()
+    return step

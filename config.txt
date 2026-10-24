@@ -125,7 +125,6 @@ FRAUD_AGE_THRESHOLD_HOURS = _env_int("FRAUD_AGE_THRESHOLD_HOURS", 24)
 BATCH_SIZE                = _env_int("BATCH_SIZE", 10)
 LEASE_SECONDS             = _env_int("LEASE_SECONDS", 300)
 MAX_ATTEMPTS              = _env_int("MAX_ATTEMPTS", 5)
-MAX_TRACE_LAYERS          = _env_int("MAX_TRACE_LAYERS", 5)
 
 # --- Upstream JSON field paths (CONFIRM against real HSBC contracts) ---
 # --- Balance enquiry: path to the balance amount in the gateway response.
@@ -135,10 +134,6 @@ MAX_TRACE_LAYERS          = _env_int("MAX_TRACE_LAYERS", 5)
 #     logs the path it found, so you can set BALANCE_PATH precisely.
 BALANCE_PATH  = _env("BALANCE_PATH", "data.accounts.0.availableBalance.amount")
 BALANCE_FIELD = _env("BALANCE_FIELD", "availableBalance")   # deep-search fallback target
-
-# Whether to auto-detect UPI transactions in CBDOC rows (IB Debit >24h path)
-# and call the UPI API for bene details. Set false to disable detection entirely.
-UPI_DETECT = _env("UPI_DETECT", "true").lower() == "true"
 
 # UPI secure-call systemId (from the working UPI contract). Numeric.
 UPI_SYSTEM_ID = _env_int("UPI_SYSTEM_ID", 403)
@@ -160,53 +155,26 @@ BQ_SEARCH_REF_FIELD   = _env("BQ_SEARCH_REF_FIELD", "LPUTRN")
 # NEFT/RTGS UTRs (HSBCN*/HSBCR*) are exactly this many chars. Shorter HSBCN*/
 # HSBCR* tokens in the same narrative are internal refs, not the UTR.
 UTR_LENGTH            = _env_int("UTR_LENGTH", 22)
-BQ_FIELD_AMOUNT       = _env("BQ_FIELD_AMOUNT", "OGPYAM")
 BQ_FIELD_DATE         = _env("BQ_FIELD_DATE", "OGCPDT")
 BQ_FIELD_TIME         = _env("BQ_FIELD_TIME", "OGCPTM")
 # Real transaction timestamp column, format 'YYYY-MM-DD-HH.MM.SS.ffffff' (IST).
 # Used to compare against the MHA fraud time. Falls back to OGCPDT/OGCPTM if empty.
 BQ_FIELD_TIMESTAMP    = _env("BQ_FIELD_TIMESTAMP", "OGTMZ1")
-# Account column. Values are stored with a leading '/', e.g. '/INHSBC006361141001'.
-# BQ_ACCOUNT_PREFIX is prepended to the account when filtering (the gateway does
-# exact-equality), and stripped when reading values client-side.
-BQ_FIELD_ACCOUNT      = _env("BQ_FIELD_ACCOUNT", "OGBEAC")
-BQ_ACCOUNT_PREFIX     = _env("BQ_ACCOUNT_PREFIX", "/")
 BQ_FIELD_BENE_ACCOUNT = _env("BQ_FIELD_BENE_ACCOUNT", "OGBEAC")
 # CBDOC column holding the beneficiary IFSC, if any. Your sample row has no IFSC
 # column, so this defaults empty; set it if your table carries one.
 BQ_FIELD_IFSC         = _env("BQ_FIELD_IFSC", "")
-CBDOC_MAX_ROWS        = _env_int("CBDOC_MAX_ROWS", 500)
 
 # Incidents at or below this amount are reported to MHA as
 # "Others Less than equal to 500" (txn_type_id 17) with no lookup/hold.
 SMALL_TXN_THRESHOLD   = Decimal(_env("SMALL_TXN_THRESHOLD", "500"))
 
-# Optional debit/credit indicator in CBDOC. If your table mixes debits and
-# credits, set BQ_DEBIT_INDICATOR_FIELD to the column and BQ_DEBIT_INDICATOR_VALUE
-# to the value that marks a debit (e.g. field="OGDRCR", value="D"). Leave the
-# field empty if the table is debit-only (OG* = outgoing payments).
-BQ_DEBIT_INDICATOR_FIELD = _env("BQ_DEBIT_INDICATOR_FIELD", "")
-BQ_DEBIT_INDICATOR_VALUE = _env("BQ_DEBIT_INDICATOR_VALUE", "D")
-
-# When true, the CBDOC account search also filters by the fraud date (BQ_FIELD_DATE)
-# so it returns that day's transactions; the caller then keeps those after the
-# fraud TIME. Set false to pull all account rows and filter purely client-side.
-CBDOC_FILTER_BY_DATE = _env("CBDOC_FILTER_BY_DATE", "false").lower() == "true"
-
-# Recent fraud (<24h) isn't in CBDOC yet (CBDOC is T+1). After a partial/no-balance
-# hold we defer reconciliation until fraud_time + CBDOC_BUFFER_HOURS (buffer past
-# the T+1 update). If CBDOC is still empty when we wake, re-defer up to
-# MAX_CBDOC_DEFERS times, then mark NEEDS_REVIEW.
-CBDOC_BUFFER_HOURS = _env_int("CBDOC_BUFFER_HOURS", 28)
+# If a NEFT/RTGS bene is still missing from CBDOC when we wake, re-defer up to
+# MAX_CBDOC_DEFERS times, then finalize.
 MAX_CBDOC_DEFERS   = _env_int("MAX_CBDOC_DEFERS", 3)
 # Recent (<24h) credit cases whose NEFT/RTGS bene isn't in CBDOC yet (CBDOC is
 # T+1) are retried the next morning at this hour, IST. UPI has no such wait.
 CBDOC_RETRY_HOUR_IST = _env_int("CBDOC_RETRY_HOUR_IST", 10)
-
-# Credit reconciliation now sources DEBITS from the live DD transaction enquiry
-# (available immediately), so recent frauds no longer need to wait for CBDOC T+1.
-# Set true to re-enable the 28h defer for recent partial/no-balance cases.
-CBDOC_DEFER_RECENT = _env("CBDOC_DEFER_RECENT", "false").lower() == "true"
 
 # --- MHA response encryption (AES-256-CBC) ---
 # Base64-encoded 32-byte key. Loaded from Secret Manager on Cloud Run; never
