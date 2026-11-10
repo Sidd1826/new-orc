@@ -9,11 +9,12 @@ import config
 import db
 import models
 import processor
-from conftest import UPI_RRN, GatewayError, incident, run, seed, state
+from conftest import UPI_RRN, GatewayError, incident, run, seed, state, txn
 
 
 @pytest.fixture
 def upi_debit(gw):
+    gw.history = [txn([UPI_RRN], "-1000.00", "2026-06-09T10:00:00+05:30")]
     seed(incidents=[incident(merchant_id=UPI_RRN)])
     return gw
 

@@ -84,11 +84,11 @@ def test_flow_picks_the_dated_record(ib_debit):
     assert obj["transaction_datetime"] == "2026-06-09 10:11:12"
 
 
-def test_flow_no_dated_record_returns_20(ib_debit):
+def test_flow_no_dated_record_returns_02(ib_debit):
     ib_debit.cbdoc_rows = [cbdoc_row(OTHER_DAY), cbdoc_row("garbage")]
     run()
     [obj] = ib_debit.sent[0]["transactions"]
-    assert (obj["status_code"], obj["remarks"]) == ("20", "Invalid RRN")
+    assert (obj["status_code"], obj["remarks"]) == ("02", "Invalid RRN")
 
 
 def test_flow_duplicates_give_one_response_object(ib_debit):

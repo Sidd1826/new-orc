@@ -122,8 +122,11 @@ class FakeGateway:
             raise self.errors.pop(name)
 
     def transaction_history(self, account, from_date=None, to_date=None):
-        self._call("transaction_history", account=account)
-        return {"data": {"accountInformation": {"transactionDetails": self.history}}}
+        self._call("transaction_history", account=account, from_date=from_date)
+        # Like HSBC: only transactions on/after the requested start date.
+        txns = [t for t in self.history
+                if not from_date or t["transactionId"]["executionTimestamp"][:10] >= from_date]
+        return {"data": {"accountInformation": {"transactionDetails": txns}}}
 
     def demand_deposit(self, account):
         self._call("demand_deposit", account=account)

@@ -26,6 +26,9 @@ def _only_response(gw):
     " 006361141001",            # padded
     "",                         # empty
     "٠٠٦٣٦١١٤١٠٠١",             # 12 non-ASCII (Arabic-Indic) digits
+    "3240868006",               # TC03: 10 digits
+    "3240A68006",               # TC04: alphanumeric
+    "32408680-6006",            # special character
 ])
 def test_invalid_account_returns_12_without_upstream_calls(gw, account):
     seed(account=account)
@@ -51,12 +54,14 @@ def test_invalid_input_missing_utr_returns_12(gw):
 
 
 def test_leading_zeros_are_kept_end_to_end(gw):
+    gw.history = [txn([UPI_RRN], "-1000.00", "2026-06-09T10:00:00+05:30")]
     seed(account="000000000012", incidents=[incident(merchant_id=UPI_RRN)])
     run()
     p, _, _ = state()
     assert p.processing_state == "RESOLVED"
     [(_, upi)] = [c for c in gw.calls if c[0] == "upi_bene_lookup"]
     assert upi["account_number"] == "000000000012"
+    assert [kw["account"] for n, kw in gw.calls if n == "transaction_history"] == ["000000000012"]
     assert _only_response(gw)["transactions"][0]["root_account_number"] == "000000000012"
 
 
@@ -97,13 +102,13 @@ def test_other_gateway_errors_are_still_retried_not_reported(gw):
     assert p.attempt_count == 1 and p.processing_state not in ("RESOLVED", "NEEDS_REVIEW")
 
 
-def test_utr_not_found_returns_20(gw):
+def test_utr_not_found_returns_02(gw):
     gw.history = [txn(["SOMETHING ELSE"], "-10.00", "2026-06-09T10:00:00+05:30")]
     seed()
     run()
     [obj] = _only_response(gw)["transactions"]
-    assert (obj["status_code"], obj["remarks"]) == ("20", "Invalid RRN")
-    assert state()[1][0].response_code == "20"
+    assert (obj["status_code"], obj["remarks"]) == ("02", "Invalid RRN")
+    assert state()[1][0].response_code == "02"
 
 
 def test_imps_and_atm_legs_return_31_pending(gw):
@@ -139,6 +144,7 @@ MONEY_TRANSFER_KEYS = {
 
 
 def test_upi_debit_with_small_incident_keeps_contract(gw):
+    gw.history = [txn([UPI_RRN], "-1000.00", "2026-06-09T10:00:00+05:30")]
     seed(incidents=[incident(merchant_id=UPI_RRN),
                     incident(merchant_id="244444440009", amount="300.00", disputed="300.00")])
     run()

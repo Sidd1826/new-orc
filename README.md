@@ -154,10 +154,16 @@ Written to `api_response_logs.response_payload` as:
 |Code|Remarks           |When                                                                 |
 |----|------------------|---------------------------------------------------------------------|
 |`00`|                  |success                                                              |
-|`01`|`Record not found`|the gateway answers HTTP 404 for the payer account                   |
+|`01`|`Record not found`|the gateway answers HTTP 404 for the payer account, or its DD transaction enquiry has no transactions|
 |`12`|`Invalid account number` / `Invalid input`|account is not exactly 12 digits, or an incident lacks amount / date / UTR|
-|`20`|`Invalid RRN`     |UTR/RRN not in the DD enquiry, or no CBDOC row dated like the UTR    |
-|`31`|`Pending`         |an IMPS or ATM debit leg (no beneficiary lookup is possible)         |
+|`02`|`Invalid RRN`     |UTR/RRN not among the account's DD transactions, or no CBDOC row dated like the UTR|
+|`31`|`Pending`         |the matched DD record is IMPS or ATM (incident or reconcile leg), or the UPI API returns no beneficiary|
+
+Every flow (UPI debit, IB debit, credit) first looks each RRN/UTR up in the
+payer account's own DD transaction enquiry, from the reported transaction date.
+The RRN must appear whole in a narrative — never inside a longer number. The
+incoming `instrument.transaction_type` is not used for classification: IMPS/ATM
+comes from the bank record's narratives.
 
 Input checks run before any upstream call. If the account and amount are
 present but **both** the transaction date and UTR are missing, only

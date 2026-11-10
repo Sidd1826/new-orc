@@ -366,6 +366,16 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
             p.processing_state = ST_ENRICHED
 
         elif st == ST_ENRICHED:
+            # Account with no DD records -> 01; RRN/UTR not among them -> 02.
+            failure = _dd_lookup_failure(s, p, account, incidents)
+            if failure:
+                code, remarks = failure
+                _finalize_miscellaneous(s, p, incidents, remarks, code)
+                p.processing_state = ST_NEEDS_REVIEW
+                p.last_error = f"{remarks} (DD transaction enquiry)"
+                p.lease_expires_at = None
+                s.add(p); s.commit()
+                break
             # UPI-debit fraud only needs beneficiary details -> no hold.
             if cls.channel == CHANNEL_UPI and cls.direction == DIR_DEBIT:
                 _finalize_bene_only(s, p, incidents)
@@ -374,24 +384,9 @@ def _run_state_machine(s: Session, p: ComplaintProcessing) -> None:
                 s.add(p); s.commit()
                 break
             # IB Debit: DD-validated UTR -> CBDOC bene -> respond, NO hold.
-            # If the UTR wasn't validated, return 'miscellaneous' to MHA.
             if cls.direction == DIR_DEBIT:
-                if not _rrn_validated(s, p, incidents):
-                    _finalize_miscellaneous(s, p, incidents, "Invalid RRN", MHA_INVALID_RRN)
-                    p.processing_state = ST_NEEDS_REVIEW
-                    p.last_error = "UTR not validated in DD enquiry (miscellaneous)"
-                else:
-                    _finalize_cbdoc_bene(s, p, incidents)
-                    p.processing_state = ST_RESOLVED
-                p.lease_expires_at = None
-                s.add(p); s.commit()
-                break
-            # CREDIT: RRN must have validated in the DD enquiry. If not, return a
-            # 'miscellaneous' response to MHA and stop — no balance, no hold.
-            if cls.direction == DIR_CREDIT and not _rrn_validated(s, p, incidents):
-                _finalize_miscellaneous(s, p, incidents, "Invalid RRN", MHA_INVALID_RRN)
-                p.processing_state = ST_NEEDS_REVIEW
-                p.last_error = "RRN not validated in DD enquiry (miscellaneous)"
+                _finalize_cbdoc_bene(s, p, incidents)
+                p.processing_state = ST_RESOLVED
                 p.lease_expires_at = None
                 s.add(p); s.commit()
                 break
@@ -534,23 +529,43 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
             incidents: list[Incident]) -> None:
     """Fetch beneficiary / transaction context.
 
-    Scenarios:
-      UPI Debit any age   → UPI API only (no hold)
-      CREDIT (any age)    → DD transaction enquiry FIRST to validate the RRN.
-                            If RRN not found in any narrative → caller stops and
-                            returns a 'miscellaneous' response to MHA (no hold).
-                            If found: balance → hold; and if >24h + partial, the
-                            reconcile step traces CBDOC debits after the fraud time.
-      IB Debit <24h       → DD transaction enquiry → balance → hold
-      IB Debit >24h       → CBDOC locate → UPI API if txn is UPI → balance → hold
+    Every flow first looks each RRN/UTR up in the payer account's own DD
+    transaction enquiry — the verified record. A miss stops the complaint at
+    ENRICHED (01 / 02, no hold, no lookup). Then:
+      UPI Debit   → UPI API bene (skipped for IMPS/ATM records), no hold
+      CREDIT      → balance → hold → reconcile (later states)
+      IB Debit    → CBDOC bene by UTR, no hold
     """
     account = instrument.payer_account_number
+    details = _dd_txn_details(s, p, account, incidents)
+    for inc in incidents:
+        idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
+        if _step_get(s, p, "DD_TXN", idem):
+            continue
+        matched = _find_txn_by_rrn(details, inc.merchant_id)
+        _step_record(s, p, "DD_TXN", idem,
+                     {"rrn": inc.merchant_id},
+                     {"found": matched is not None, "matched": matched or {}})
+        if matched is None:
+            log.warning("[%s] RRN=%s not found in DD enquiry narratives",
+                        p.acknowledgement_no, inc.merchant_id)
+            _log_rrn_miss(p, details, inc.merchant_id)
+        else:
+            log.info("[%s] RRN=%s MATCHED. transaction=%s",
+                     p.acknowledgement_no, inc.merchant_id,
+                     json.dumps(matched, default=str))
 
-    # --- UPI Debit: short-circuit, bene lookup only, no hold ---
-    if cls.channel == CHANNEL_UPI and cls.direction == DIR_DEBIT:
-        for inc in incidents:
+    if cls.direction == DIR_CREDIT:
+        return
+
+    for inc in incidents:
+        matched = _dd_match(s, p, inc)
+        if matched is None:
+            continue
+        if cls.channel == CHANNEL_UPI:
+            # UPI Debit: bene from the UPI API — never for an IMPS/ATM record.
             idem = f"UPI:{p.acknowledgement_no}:{inc.merchant_id}"
-            if _step_get(s, p, "UPI_BENE", idem):
+            if _step_get(s, p, "UPI_BENE", idem) or _is_imps_or_atm(matched):
                 continue
             ts = f"{inc.transaction_date} {inc.transaction_time}"
             resp = gateway().upi_bene_lookup(
@@ -559,56 +574,36 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                 ack_id=p.acknowledgement_no,
             )
             _step_record(s, p, "UPI_BENE", idem, {"rrn": inc.merchant_id}, resp)
-        return
-
-    # --- CREDIT (any age): validate RRN in the live DD transaction enquiry FIRST ---
-    if cls.direction == DIR_CREDIT:
-        details = _dd_txn_details(s, p, account, incidents)
-        for inc in incidents:
-            idem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
-            if _step_get(s, p, "DD_TXN", idem):
-                continue
-            matched = _find_txn_by_rrn(details, inc.merchant_id)
-            _step_record(s, p, "DD_TXN", idem,
-                         {"rrn": inc.merchant_id},
-                         {"found": matched is not None, "matched": matched or {}})
-            if matched is None:
-                log.warning("[%s] RRN=%s not found in DD enquiry narratives",
-                            p.acknowledgement_no, inc.merchant_id)
-                _log_rrn_miss(p, details, inc.merchant_id)
-            else:
-                log.info("[%s] RRN=%s MATCHED. transaction=%s",
-                         p.acknowledgement_no, inc.merchant_id,
-                         json.dumps(matched, default=str))
-        return
-
-    # --- IB Debit: validate UTR in DD enquiry, then CBDOC (by UTR) for bene.
-    #     No hold — like UPI Debit, but bene comes from CBDOC not the UPI API. ---
-    if cls.direction == DIR_DEBIT:
-        details = _dd_txn_details(s, p, account, incidents)
-        for inc in incidents:
-            ddidem = f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}"
-            if not _step_get(s, p, "DD_TXN", ddidem):
-                matched = _find_txn_by_rrn(details, inc.merchant_id)
-                _step_record(s, p, "DD_TXN", ddidem, {"rrn": inc.merchant_id},
-                             {"found": matched is not None, "matched": matched or {}})
-                if matched is None:
-                    log.warning("[%s] UTR=%s not found in DD enquiry narratives",
-                                p.acknowledgement_no, inc.merchant_id)
-                    _log_rrn_miss(p, details, inc.merchant_id)
-                    continue
-                log.info("[%s] UTR=%s MATCHED in DD enquiry", p.acknowledgement_no, inc.merchant_id)
-
-            # UTR validated -> fetch bene details from CBDOC by the UTR/RRN.
+        else:
+            # IB Debit: UTR validated -> fetch bene details from CBDOC by the UTR.
             bqidem = f"CBDOCBENE:{p.acknowledgement_no}:{inc.merchant_id}"
             if _step_get(s, p, "CBDOC_BENE", bqidem):
                 continue
             bq = gateway().bigquery_search({config.BQ_SEARCH_REF_FIELD: inc.merchant_id}, limit=5)
             _step_record(s, p, "CBDOC_BENE", bqidem, {config.BQ_FIELD_REF: inc.merchant_id}, bq)
-            n = len(_rows(bq))
             log.info("[%s] CBDOC bene lookup by UTR=%s -> %d rows",
-                     p.acknowledgement_no, inc.merchant_id, n)
-        return
+                     p.acknowledgement_no, inc.merchant_id, len(_rows(bq)))
+
+
+def _dd_match(s: Session, p: ComplaintProcessing, inc: Incident) -> Optional[dict]:
+    """The DD transaction this incident's RRN matched, or None if it didn't."""
+    step = _step_get(s, p, "DD_TXN", f"DDTXN:{p.acknowledgement_no}:{inc.merchant_id}")
+    payload = (step.response_payload or {}) if step else {}
+    return payload.get("matched") if payload.get("found") else None
+
+
+def _is_imps_or_atm(txn: dict) -> bool:
+    return _scheme_from_narratives(txn) in ("IMPS", "ATM")
+
+
+def _dd_lookup_failure(s: Session, p: ComplaintProcessing, account: str,
+                       incidents: list[Incident]) -> Optional[tuple[str, str]]:
+    """(MHA code, remarks) when the DD enquiry can't confirm every incident."""
+    if not _dd_txn_details(s, p, account, incidents):      # cached; no records at all
+        return MHA_RECORD_NOT_FOUND, "Record not found"
+    if not _rrn_validated(s, p, incidents):
+        return MHA_INVALID_RRN, "Invalid RRN"
+    return None
 
 
 def _dd_txn_details(s: Session, p: ComplaintProcessing, account: str,
@@ -747,27 +742,19 @@ def _deep_find_txn_list(resp: Any) -> list[dict]:
 def _find_txn_by_rrn(details: list[dict], rrn: str) -> Optional[dict]:
     """Find the transaction whose narratives reference this RRN.
 
-    Matching is tolerant: case-insensitive, whitespace-stripped, and matches if
-    the RRN equals a narrative, appears as a delimited token (/, space, |, -, :,
-    comma), or is contained as a substring (for refs >= 6 chars, to avoid false
-    positives on short numbers)."""
+    Case-insensitive. The RRN must appear WHOLE in a narrative token (split on
+    / space | , : -): equal to it, or — for refs >= 6 chars — glued to letters
+    ("UPI630815826975"). It never matches inside a longer number
+    ("1630815826975") and a short narrative never "contains" it ("9", "6308")."""
     target = _norm_ref(rrn)
     if not target:
         return None
+    whole = re.compile(rf"(?<![0-9]){re.escape(target)}(?![0-9])")
     for txn in details:
         for nv in _narratives(txn):
-            nnv = _norm_ref(nv)
-            if not nnv:
-                continue
-            if nnv == target:
-                return txn
-            # delimited tokens
-            tokens = re.split(r"[/\s|,:\-]+", nnv)
-            if target in tokens:
-                return txn
-            # substring (only for sufficiently long refs)
-            if len(target) >= 6 and (target in nnv or nnv in target):
-                return txn
+            for tok in re.split(r"[/\s|,:\-]+", nv.upper()):
+                if tok == target or (len(target) >= 6 and whole.search(tok)):
+                    return txn
     return None
 
 
@@ -1107,7 +1094,7 @@ MHA_BANK_CODE = "00"
 MHA_OK               = "00"   # SUCCESS
 MHA_RECORD_NOT_FOUND = "01"   # Record not found
 MHA_INVALID_INPUT    = "12"   # Invalid input / account number
-MHA_INVALID_RRN      = "20"   # Invalid RRN (UTR not found)
+MHA_INVALID_RRN      = "02"   # Invalid RRN (UTR not found)
 MHA_PENDING          = "31"   # Pending (IMPS / ATM)
 
 
@@ -1745,13 +1732,18 @@ def _finalize_dd_probe(s: Session, p: ComplaintProcessing, instrument: Instrumen
 
 def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Incident]) -> None:
     """UPI-debit: one 'Money Transfer To' per incident, populated from the UPI
-    beneficiary lookup."""
+    beneficiary lookup. An IMPS/ATM record, or a UPI reply with no beneficiary
+    account (the UPI switch doesn't know it — same rule as _bene_for_rrn), is
+    reported as 31 Pending, never as a SUCCESS with blank payee fields."""
     root = _root_ctx(s, p)
     txns = []
     for inc in incidents:
         step = _step_get(s, p, "UPI_BENE", f"UPI:{p.acknowledgement_no}:{inc.merchant_id}")
         raw = (_dig(step.response_payload, "data") or step.response_payload) if step and step.response_payload else {}
         bene = _normalise_bene(raw or {})
+        if _is_imps_or_atm(_dd_match(s, p, inc) or {}) or not bene["account"]:
+            txns.append(_incident_failure(root, inc, MHA_PENDING, "Pending"))
+            continue
         txns.append(_mha_money_transfer_to(
             rrn=inc.merchant_id,
             payee_bank=bene.get("bank", ""),
@@ -1767,11 +1759,13 @@ def _finalize_bene_only(s: Session, p: ComplaintProcessing, incidents: list[Inci
         root_bankid=root["root_bankid"],
             effective_balance=root["root_effective_balance"],
         ))
+    pending = all(t["status_code"] == MHA_PENDING for t in txns)
     _write_response_log(s, p, {
         "acknowledgement_no": p.acknowledgement_no,
         "job_id": p.job_id,
         "transactions": txns,
-    })
+    }, response_code=MHA_PENDING if pending else MHA_OK,
+       response_message="PENDING" if pending else "SUCCESS")
 
 
 def _write_response_log(s: Session, p: ComplaintProcessing, payload: dict,
