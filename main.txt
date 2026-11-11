@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Body, FastAPI, HTTPException
@@ -136,28 +135,24 @@ async def process_batch():
 async def process_one(ack_no: str):
     def _run():
         with session_scope() as s:
-            c = s.execute(
-                select(Complaint).where(Complaint.acknowledgement_no == ack_no)
-            ).scalar_one_or_none()
-            if c is None:
+            if s.execute(select(Complaint.id).where(
+                    Complaint.acknowledgement_no == ack_no)).scalar_one_or_none() is None:
                 return None
-            p = s.execute(
-                select(ComplaintProcessing).where(
-                    ComplaintProcessing.complaint_id == c.id)
-            ).scalar_one_or_none()
-            if p is None:
-                p = ComplaintProcessing(
-                    complaint_id=c.id, acknowledgement_no=c.acknowledgement_no,
-                    job_id=f"BANKS-{uuid.uuid4()}",
-                )
-                s.add(p); s.commit()
-            pid = p.id
-        return processor._process_one(pid)
+        # Same lease as the batch: never runs alongside a worker that holds it.
+        ids = processor.claim_batch(1, ack_no=ack_no)
+        if ids:
+            return processor._process_one(ids[0]), True
+        with session_scope() as s:
+            p = s.execute(select(ComplaintProcessing).where(
+                ComplaintProcessing.acknowledgement_no == ack_no)).scalar_one_or_none()
+            return (p.processing_state if p else "NOT_PICKED_UP"), False
 
-    state = await asyncio.to_thread(_run)
-    if state is None:
+    res = await asyncio.to_thread(_run)
+    if res is None:
         raise HTTPException(404, detail=f"complaint {ack_no} not found")
-    return {"acknowledgement_no": ack_no, "state": state}
+    state, claimed = res
+    # claimed=False: terminal, leased by a worker, backing off, or out of attempts.
+    return {"acknowledgement_no": ack_no, "state": state, "claimed": claimed}
 
 
 # ---------------------------------------------------------------------------

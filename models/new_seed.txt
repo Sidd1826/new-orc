@@ -1,15 +1,20 @@
 -- =============================================================================
--- seed_tests.sql — 10 labelled test complaints, one per code path.
+-- seed_tests.sql — labelled test complaints for a LOCAL database.
 -- Run in DBeaver with "Execute SQL Script" (Alt+X) so ALL statements run.
--- Each uses a DISTINCT acknowledgement_no + payer_account_number so they
--- coexist and the mock gateway can pick balance/trace behaviour per account.
+-- Requires migration.sql (VARCHAR mode/type columns). Re-runnable: every
+-- complaint is inserted ON CONFLICT DO NOTHING, so running it again never
+-- duplicates rows and never needs a TRUNCATE. Never run it against a shared DB.
 --
--- Dates are RELATIVE TO NOW() so "recent" (< 24h) vs "old" (> 24h) is correct
--- on your machine's clock regardless of the calendar date.
+-- After seeding: start mock + app, then POST /process-batch (BATCH_SIZE 10, so
+-- run it twice for all 17).
 --
--- After seeding: start mock + app, then POST /process-batch (batch size 10
--- handles all in one tick). Expected outcomes are in TEST_MATRIX.md.
--- Re-run from scratch: TRUNCATE the tables (see bottom) then run this again.
+-- EXPECTED OUTCOMES (current code + mock_gateway):
+--   TC01-TC09  their accounts ('ACC-FULL-0001' ...) are not 12 digits, so each
+--              now ends NEEDS_REVIEW with 12 / Invalid account number before any
+--              gateway call. (They predate the 12-digit check; the hold/trace
+--              walkthrough in README section 8 no longer applies to them.)
+--   TC10       no instrument -> NEEDS_REVIEW, no response row.
+--   The I4C-MHA sheet block at the bottom lists its own expectations.
 -- =============================================================================
 
 -- helper timestamps
@@ -18,7 +23,8 @@
 
 -- ---- TC01: IB Debit, recent, balance covers -> FULL HOLD -> RESOLVED ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC01', 'Net Banking Fraud', 'OPEN') RETURNING id),
+           VALUES ('TC01', 'Net Banking Fraud', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Debit'::payment_mode,'P2P'::transaction_type,
@@ -28,7 +34,8 @@ SELECT i.id,'244444440001',35.00,35.00,0,(NOW()-INTERVAL '3 hours')::date,(NOW()
 
 -- ---- TC02: IB Debit, recent, TWO incidents (35+65=100) -> FULL HOLD 100 -> RESOLVED ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC02', 'Net Banking Fraud', 'OPEN') RETURNING id),
+           VALUES ('TC02', 'Net Banking Fraud', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Debit'::payment_mode,'P2P'::transaction_type,
@@ -39,7 +46,8 @@ FROM i, (VALUES ('244444440002a',35.00),('244444440002b',65.00)) AS v(m,amt);
 
 -- ---- TC03: IB Debit, OLD (>24h), balance covers -> BQ-locate in enrich, FULL HOLD 50 -> RESOLVED ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC03', 'Net Banking Fraud', 'OPEN') RETURNING id),
+           VALUES ('TC03', 'Net Banking Fraud', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Debit'::payment_mode,'P2P'::transaction_type,
@@ -49,7 +57,8 @@ SELECT i.id,'244444440003',50.00,50.00,0,(NOW()-INTERVAL '4 days')::date,(NOW()-
 
 -- ---- TC04: IB Credit, recent, balance covers -> FULL HOLD 75 -> RESOLVED ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC04', 'Net Banking Fraud', 'OPEN') RETURNING id),
+           VALUES ('TC04', 'Net Banking Fraud', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Credit'::payment_mode,'P2M'::transaction_type,
@@ -59,7 +68,8 @@ SELECT i.id,'244444440004',75.00,75.00,0,(NOW()-INTERVAL '3 hours')::date,(NOW()
 
 -- ---- TC05: IB Debit, balance 20 < disputed 35 -> PARTIAL HOLD 20 + TRACE recovers 1000 -> RESOLVED ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC05', 'Net Banking Fraud', 'OPEN') RETURNING id),
+           VALUES ('TC05', 'Net Banking Fraud', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Debit'::payment_mode,'P2P'::transaction_type,
@@ -69,7 +79,8 @@ SELECT i.id,'244444440005',35.00,35.00,0,(NOW()-INTERVAL '3 hours')::date,(NOW()
 
 -- ---- TC06: IB Debit, balance 20 < disputed 35, TRACE recovers only 5 (<15) -> NEEDS_REVIEW ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC06', 'Net Banking Fraud', 'OPEN') RETURNING id),
+           VALUES ('TC06', 'Net Banking Fraud', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Debit'::payment_mode,'P2P'::transaction_type,
@@ -79,7 +90,8 @@ SELECT i.id,'244444440006',35.00,35.00,0,(NOW()-INTERVAL '3 hours')::date,(NOW()
 
 -- ---- TC07: IB Debit, balance 0 -> HOLD 0, TRACE recovers 1000 -> RESOLVED (trace-only) ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC07', 'Net Banking Fraud', 'OPEN') RETURNING id),
+           VALUES ('TC07', 'Net Banking Fraud', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Debit'::payment_mode,'P2P'::transaction_type,
@@ -89,7 +101,8 @@ SELECT i.id,'244444440007',35.00,35.00,0,(NOW()-INTERVAL '3 hours')::date,(NOW()
 
 -- ---- TC08: UPI Debit -> BENEFICIARY LOOKUP ONLY (no balance, no hold) -> RESOLVED ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC08', 'UPI Related Frauds', 'OPEN') RETURNING id),
+           VALUES ('TC08', 'UPI Related Frauds', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, wallet, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','UPI'::payment_mode,'P2P'::transaction_type,
@@ -99,7 +112,8 @@ SELECT i.id,'244444440008',35.00,35.00,0,(NOW()-INTERVAL '3 hours')::date,(NOW()
 
 -- ---- TC09: UPI Credit -> HOLD path (balance covers) -> FULL HOLD 40 -> RESOLVED ----
 WITH c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
-           VALUES ('TC09', 'UPI Related Frauds', 'OPEN') RETURNING id),
+           VALUES ('TC09', 'UPI Related Frauds', 'OPEN')
+           ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id),
      i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
               mode_of_payment, transaction_type, wallet, payer_mobile_number, payer_account_number, state, district)
            SELECT c.id,'I4C-MHA','HSBC','10','Credit'::payment_mode,'P2M'::transaction_type,
@@ -109,11 +123,44 @@ SELECT i.id,'244444440009',40.00,40.00,0,(NOW()-INTERVAL '3 hours')::date,(NOW()
 
 -- ---- TC10: complaint with NO instrument/incidents -> NEEDS_REVIEW (edge) ----
 INSERT INTO complaints (acknowledgement_no, sub_category, status)
-VALUES ('TC10', 'Other', 'OPEN');
+VALUES ('TC10', 'Other', 'OPEN')
+ON CONFLICT (acknowledgement_no) DO NOTHING;
+
+-- ---- I4C-MHA sheet fixtures (3160823000011-16 + corrected 0015) -------------
+-- Transaction date 2026-11-04, layer 0, Debit, HSBC bank code 10, disputed =
+-- amount. Expected with mock_gateway's fixture accounts:
+--   3160823000011   003240868006 RRN 630818826981 -> 00 Money Transfer To (UPI record)
+--   3160823000012   999999999999 (mock: HTTP 404) -> 01 Record not found
+--   3160823000013   3240868006   (10 digits)      -> 12 Invalid account number, no gateway call
+--   3160823000014   3240A68006   (alphanumeric)   -> 12 Invalid account number, no gateway call
+--   3160823000015   999999999999 RRN 999999999999 -> 01: the account check wins; never 02
+--   3160823000015C  003240868006 RRN 999999999999 -> 02 Invalid RRN (corrected fixture:
+--                   a known account whose history lacks that RRN)
+--   3160823000016   003240868006 RRN 630815826944 -> 31 Pending (the bank record is IMPS;
+--                   transaction_type 'IMPS' is kept as metadata only)
+WITH v(ack, acct, rrn, amt, tm, ttype) AS (VALUES
+    ('3160823000011',  '003240868006', '630818826981', 50000.00, '18:44', 'Unknown'),
+    ('3160823000012',  '999999999999', '630815826975',  1000.00, '15:52', 'Unknown'),
+    ('3160823000013',  '3240868006',   '630815826952',   900.00, '15:16', 'Unknown'),
+    ('3160823000014',  '3240A68006',   '630815826952',   900.00, '15:16', 'Unknown'),
+    ('3160823000015',  '999999999999', '999999999999',  1000.00, '15:12', 'Unknown'),
+    ('3160823000015C', '003240868006', '999999999999',  1000.00, '15:12', 'Unknown'),
+    ('3160823000016',  '003240868006', '630815826944',   900.00, '15:11', 'IMPS')),
+c AS (INSERT INTO complaints (acknowledgement_no, sub_category, status)
+      SELECT ack, 'UPI Related Frauds', 'OPEN' FROM v
+      ON CONFLICT (acknowledgement_no) DO NOTHING RETURNING id, acknowledgement_no),
+i AS (INSERT INTO instruments (complaint_id, requestor, payer_bank, payer_bank_code,
+          mode_of_payment, transaction_type, wallet, payer_mobile_number,
+          payer_account_number, state, district)
+      SELECT c.id, 'I4C-MHA', 'HSBC', '10', 'Debit', v.ttype, 'Phonepe', '919798868768',
+             v.acct, 'DELHI', 'South Delhi'
+      FROM c JOIN v ON v.ack = c.acknowledgement_no RETURNING id, complaint_id)
+INSERT INTO incidents (instrument_id, merchant_id, amount, disputed_amount, layer,
+                       transaction_date, transaction_time)
+SELECT i.id, v.rrn, v.amt, v.amt, 0, DATE '2026-11-04', v.tm::time
+FROM i JOIN c ON c.id = i.complaint_id JOIN v ON v.ack = c.acknowledgement_no;
 
 -- =============================================================================
--- Reset helper (uncomment to wipe everything and start over):
--- TRUNCATE complaints, instruments, incidents,
---          complaint_processing, processing_steps, api_response_logs
--- RESTART IDENTITY CASCADE;
+-- No reset helper on purpose: this file is re-runnable as is. To start over,
+-- use a fresh local database rather than truncating shared tables.
 -- =============================================================================

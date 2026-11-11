@@ -40,13 +40,16 @@ class InstrumentIn(BaseModel):
     @field_validator("transaction_type", mode="before")
     @classmethod
     def _normalise_txn_type(cls, v):
-        """MHA may send '' or odd casing. Map to the DB enum
-        ('P2P','P2M','Collect','Refund','Unknown'); blank/unknown -> 'Unknown'."""
+        """MHA may send '' or odd casing. Known categories get their canonical
+        spelling; blank -> 'Unknown'. Anything else (e.g. a scheme like 'IMPS')
+        is kept as sent — it is metadata only, never used for routing (the bank
+        record decides IMPS/ATM) — so it isn't silently erased. The column is
+        VARCHAR after migration.sql."""
         if v is None or str(v).strip() == "":
             return "Unknown"
         allowed = {"p2p": "P2P", "p2m": "P2M", "collect": "Collect",
                    "refund": "Refund", "unknown": "Unknown"}
-        return allowed.get(str(v).strip().lower(), "Unknown")
+        return allowed.get(str(v).strip().lower(), str(v).strip())
     wallet: Optional[str] = None
     payer_mobile_number: str = Field(validation_alias=AliasChoices("payer_mobile_number", "payer mobile number"))
     payer_account_number: str = Field(validation_alias=AliasChoices("payer_account_number", "payer account number"))

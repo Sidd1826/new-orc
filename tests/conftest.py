@@ -24,11 +24,12 @@ from sqlalchemy.ext.compiler import compiles
 
 ROOT = Path(__file__).resolve().parents[1]
 _APP_MODULES = {"config", "logger", "db", "models", "classifier", "gateway_client",
-                "encryption", "bank_codes", "processor", "schemas", "main"}
+                "encryption", "bank_codes", "processor", "schemas", "main", "mock_gateway"}
 
 sys.dont_write_bytecode = True                  # don't litter the repo with .pyc
 os.environ.pop("GOOGLE_CLOUD_PROJECT", None)    # never reach Secret Manager
 os.environ.pop("DATABASE_URL", None)
+os.environ.pop("MHA_DEV_MODE", None)            # a real deployment's default
 
 
 class _TxtModules:
@@ -111,6 +112,7 @@ class FakeGateway:
         self.calls: list[tuple[str, dict]] = []
         self.sent: list[dict] = []          # decrypted MHA responses
         self.history: list[dict] = []       # DD transaction-history txns
+        self.history_resp = None             # if set: returned verbatim (malformed replies)
         self.balance = "100000.00"
         self.cbdoc_rows: list[dict] = []
         self.errors: dict[str, Exception] = {}   # method name -> exception to raise once
@@ -123,6 +125,8 @@ class FakeGateway:
 
     def transaction_history(self, account, from_date=None, to_date=None):
         self._call("transaction_history", account=account, from_date=from_date)
+        if self.history_resp is not None:
+            return self.history_resp
         # Like HSBC: only transactions on/after the requested start date.
         txns = [t for t in self.history
                 if not from_date or t["transactionId"]["executionTimestamp"][:10] >= from_date]
@@ -175,13 +179,14 @@ def incident(merchant_id=UTR, amount="1000.00", disputed="1000.00", layer=0,
                 transaction_date=d, transaction_time=t)
 
 
-def seed(ack="ACK0000000001", account=ACCOUNT, mode="Debit", incidents=None) -> int:
+def seed(ack="ACK0000000001", account=ACCOUNT, mode="Debit", incidents=None,
+         sub_category="Fraud", transaction_type="P2P", wallet=None) -> int:
     """Insert a complaint the way the upstream service does; returns its id."""
     with db.session_scope() as s:
-        c = models.Complaint(acknowledgement_no=ack, sub_category="Fraud", status="OPEN")
+        c = models.Complaint(acknowledgement_no=ack, sub_category=sub_category, status="OPEN")
         inst = models.Instrument(requestor="I4C-MHA", payer_bank="HSBC", payer_bank_code="10",
-                                 mode_of_payment=mode, transaction_type="P2P",
-                                 payer_mobile_number="919000000001",
+                                 mode_of_payment=mode, transaction_type=transaction_type,
+                                 wallet=wallet, payer_mobile_number="919798868768",
                                  payer_account_number=account)
         inst.incidents = [models.Incident(**i) for i in (incidents or [incident()])]
         c.instrument = inst

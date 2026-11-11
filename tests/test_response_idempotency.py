@@ -69,8 +69,10 @@ def response_ready(upi_debit, monkeypatch):
     """A finalized complaint whose callback has not been sent yet."""
     key = config.MHA_RESPONSE_KEY_B64
     monkeypatch.setattr(config, "MHA_RESPONSE_KEY_B64", "")   # dev mode: no send
+    monkeypatch.setattr(config, "MHA_DEV_MODE", True)
     run()
     monkeypatch.setattr(config, "MHA_RESPONSE_KEY_B64", key)
+    monkeypatch.setattr(config, "MHA_DEV_MODE", False)
     assert upi_debit.sent == [] and state()[2] == []
     return upi_debit
 

@@ -88,8 +88,8 @@ def test_tc06_tc07_imps_or_atm_record_returns_31_pending(gw, scheme):
 def test_incoming_transaction_type_does_not_override_the_record(gw):
     """instrument.transaction_type is never read: a UPI record stays UPI."""
     gw.history = [txn(["UPI", RRN], "-1500.00", WHEN)]
-    seed(incidents=[_fraud()])            # seed() uses transaction_type 'P2P'; 'IMPS'
-    run()                                 # is coerced to 'Unknown' at ingest anyway
+    seed(incidents=[_fraud()], transaction_type="IMPS")
+    run()
     assert _result(gw)[2][0]["status_code"] == "00"
 
 
@@ -109,7 +109,8 @@ def test_mixed_incidents_keep_per_incident_codes(gw):
     run()
     _, log, objs = _result(gw)
     assert [o["status_code"] for o in objs] == ["00", "31"]
-    assert (log.response_code, log.response_message) == ("00", "SUCCESS")
+    # mixed is never stored as complete success (see processor._business_result)
+    assert (log.response_code, log.response_message, log.is_success) == ("31", "PENDING", False)
 
 
 # --- TC08: valid account + valid RRN + normal UPI transaction ---------------------------

@@ -1,0 +1,165 @@
+-- =============================================================================
+-- diagnostics.sql — READ-ONLY investigation of the six I4C-MHA sheet complaints
+-- (3160823000011..16). Every statement is a SELECT; nothing is written, nothing
+-- is replayed. To be certain, run it inside a read-only transaction:
+--     BEGIN READ ONLY;  <statements>  ROLLBACK;
+-- To look at other complaints, edit the `acks` list in each statement.
+--
+-- Concepts kept apart (do not read one as another):
+--   receipt      api_response_logs row the INGEST SERVICE writes on arrival
+--                (complaint_id NULL, no payload, its own job_id, code 00). It is
+--                NOT a business result; is_success there only means "received".
+--   business     the FINAL row this orchestrator writes, keyed by
+--                complaint_processing.job_id — usually a DIFFERENT job_id.
+--   processing   complaint_processing state / attempts / lease / last_error.
+--   delivery     processing_steps MHA_RESPONSE (SUCCESS = gateway HTTP 2xx).
+--   acceptance   processing_steps MHA_ACK (SUCCESS = MHA ack statuscode 00 for
+--                this job_id) and api_response_logs.acknowledgement_mha.
+--
+-- Before attributing behaviour to the code in this repo, confirm what is
+-- deployed (read-only commands, run them yourself):
+--   gcloud run services describe <SERVICE> --region <REGION> \
+--     --format='value(status.latestReadyRevisionName,spec.template.spec.containers[0].image)'
+--   gcloud logging read 'resource.type="cloud_run_revision" AND
+--     resource.labels.service_name="<SERVICE>" AND textPayload:"3160823000011"' \
+--     --limit 100 --format='value(timestamp,resource.labels.revision_name,textPayload)'
+-- and compare the image's commit with `git log` here. Statement 0 shows the
+-- deployed schema; MHA_ACK step rows exist only from this revision on.
+-- =============================================================================
+
+-- 0. Deployed schema of the six tables (columns, nullability, generated exprs).
+SELECT table_name, column_name, data_type, is_nullable, column_default,
+       is_generated, generation_expression
+FROM information_schema.columns
+WHERE table_schema = current_schema()
+  AND table_name IN ('complaints', 'instruments', 'incidents', 'api_response_logs',
+                     'complaint_processing', 'processing_steps')
+ORDER BY table_name, ordinal_position;
+
+-- 0b. Step kinds this deployment has ever written (no MHA_ACK => older revision).
+SELECT step, status, count(*) AS n, min(created_at) AS first_at, max(updated_at) AS last_at
+FROM processing_steps
+GROUP BY step, status
+ORDER BY step, status;
+
+-- 1. Complaint -> processing sidecar: state, attempts, lease, backoff, last error.
+WITH acks(ack) AS (VALUES ('3160823000011'), ('3160823000012'), ('3160823000013'),
+                          ('3160823000014'), ('3160823000015'), ('3160823000016'))
+SELECT a.ack,
+       c.id                         AS complaint_id,
+       c.status                     AS complaint_status,
+       c.created_at                 AS ingested_at,
+       i.payer_account_number,
+       length(i.payer_account_number) AS account_len,
+       i.mode_of_payment, i.transaction_type, i.wallet,
+       p.id                         AS processing_id,
+       p.processing_state,
+       p.job_id                     AS processing_job_id,
+       p.attempt_count,
+       p.lease_expires_at,
+       p.lease_expires_at > now()   AS lease_active,
+       p.next_attempt_at,
+       p.defer_count,
+       p.last_error,
+       p.created_at                 AS picked_up_at,
+       CASE WHEN c.id IS NULL THEN 'NOT INGESTED'
+            WHEN p.id IS NULL THEN 'NOT PICKED UP (no batch tick since ingest?)'
+            ELSE p.processing_state END AS verdict
+FROM acks a
+LEFT JOIN complaints c           ON c.acknowledgement_no = a.ack
+LEFT JOIN instruments i          ON i.complaint_id = c.id
+LEFT JOIN complaint_processing p ON p.complaint_id = c.id
+ORDER BY a.ack;
+
+-- 2. Incidents as stored (did the leading zeros / RRN / date survive ingest?).
+WITH acks(ack) AS (VALUES ('3160823000011'), ('3160823000012'), ('3160823000013'),
+                          ('3160823000014'), ('3160823000015'), ('3160823000016'))
+SELECT a.ack, inc.id AS incident_id, inc.merchant_id AS rrn, length(inc.merchant_id) AS rrn_len,
+       inc.amount, inc.disputed_amount, inc.layer, inc.transaction_date, inc.transaction_time
+FROM acks a
+JOIN complaints c  ON c.acknowledgement_no = a.ack
+JOIN instruments i ON i.complaint_id = c.id
+JOIN incidents inc ON inc.instrument_id = i.id
+ORDER BY a.ack, inc.id;
+
+-- 3. Every api_response_logs row for the acks, classified, with the per-object
+--    codes MHA receives. Receipt and final rows are matched on their own job_ids.
+WITH acks(ack) AS (VALUES ('3160823000011'), ('3160823000012'), ('3160823000013'),
+                          ('3160823000014'), ('3160823000015'), ('3160823000016'))
+SELECT a.ack, l.id, l.job_id, l.complaint_id,
+       CASE WHEN p.job_id IS NOT NULL AND l.job_id = p.job_id
+                THEN 'FINAL (this orchestrator job)'
+            WHEN l.complaint_id IS NULL
+                 AND (l.response_payload IS NULL OR jsonb_typeof(l.response_payload) <> 'object')
+                THEN 'RECEIPT (ingest service, not a business result)'
+            ELSE 'OTHER (earlier job or another writer: investigate)' END AS row_kind,
+       l.response_code AS summary_code, l.response_message, l.is_success,
+       (SELECT jsonb_agg(jsonb_build_object(
+                   'rrn',         COALESCE(t->>'rrn_transaction_id', t->>'root_rrn_transaction_id'),
+                   'status_code', t->>'status_code',
+                   'remarks',     t->>'remarks',
+                   'txn_type_id', t->>'txn_type_id'))
+          FROM jsonb_array_elements(
+                 CASE WHEN jsonb_typeof(l.response_payload -> 'transactions') = 'array'
+                      THEN l.response_payload -> 'transactions' ELSE '[]'::jsonb END) t
+       ) AS transaction_codes,
+       l.acknowledgement_mha ->> 'statuscode' AS mha_statuscode,
+       l.acknowledgement_mha ->> 'message'    AS mha_message,
+       l.requested_at, l.responded_at, l.created_at, l.updated_at
+FROM acks a
+JOIN api_response_logs l          ON btrim(l.acknowledgement_no) = a.ack
+LEFT JOIN complaints c            ON c.acknowledgement_no = a.ack
+LEFT JOIN complaint_processing p  ON p.complaint_id = c.id
+ORDER BY a.ack, l.id;
+
+-- 4. Every external call / side effect, in order (stashes omitted).
+WITH acks(ack) AS (VALUES ('3160823000011'), ('3160823000012'), ('3160823000013'),
+                          ('3160823000014'), ('3160823000015'), ('3160823000016'))
+SELECT a.ack, s.id, s.job_id, s.step, s.status, s.attempt, s.idempotency_key,
+       s.created_at, s.updated_at,
+       s.response_payload ->> 'error'       AS error,
+       s.response_payload ->> 'status_code' AS error_http_status,
+       s.response_payload ->> 'problem'     AS acceptance_problem,
+       s.request_payload
+FROM acks a
+JOIN processing_steps s ON s.acknowledgement_no = a.ack
+WHERE s.step NOT LIKE 'STASH%'
+ORDER BY a.ack, s.id;
+
+-- 5. One line per ack: business result vs delivery vs MHA acceptance vs holds.
+WITH acks(ack) AS (VALUES ('3160823000011'), ('3160823000012'), ('3160823000013'),
+                          ('3160823000014'), ('3160823000015'), ('3160823000016'))
+SELECT a.ack, p.processing_state, p.job_id, p.attempt_count, p.last_error,
+       fin.response_code              AS business_code,
+       fin.response_message           AS business_message,
+       d.status                       AS delivery_status,
+       d.attempt                      AS delivery_attempts,
+       k.status                       AS mha_acceptance,
+       k.response_payload ->> 'problem' AS acceptance_problem,
+       fin.acknowledgement_mha ->> 'statuscode' AS mha_statuscode,
+       h.holds,
+       CASE WHEN c.id IS NULL      THEN 'NOT INGESTED'
+            WHEN p.id IS NULL      THEN 'NOT PICKED UP'
+            WHEN fin.id IS NULL AND p.processing_state IN ('RESOLVED', 'NEEDS_REVIEW')
+                                   THEN 'TERMINAL WITHOUT A RESPONSE: read last_error'
+            WHEN fin.id IS NULL    THEN 'IN PROGRESS / RETRYING: read last_error, next tick after lease'
+            WHEN d.id IS NULL      THEN 'RESPONSE STORED, NEVER SENT (dev mode, or send not reached)'
+            WHEN d.status = 'PENDING' THEN 'SEND OUTCOME UNKNOWN: reconcile with MHA before any resend'
+            WHEN d.status = 'FAILURE' THEN 'SEND FAILED: retried until attempts are exhausted'
+            WHEN k.status = 'SUCCESS' THEN 'ACCEPTED BY MHA'
+            WHEN k.status = 'FAILURE' THEN 'DELIVERED, REJECTED BY MHA'
+            WHEN k.id IS NULL      THEN 'DELIVERED, acceptance not recorded by this revision (see mha_statuscode)'
+            ELSE 'DELIVERED, ACCEPTANCE UNKNOWN' END AS verdict
+FROM acks a
+LEFT JOIN complaints c            ON c.acknowledgement_no = a.ack
+LEFT JOIN complaint_processing p  ON p.complaint_id = c.id
+LEFT JOIN api_response_logs fin   ON fin.job_id = p.job_id
+LEFT JOIN processing_steps d      ON d.idempotency_key = 'MHARESP:' || a.ack || ':' || p.job_id
+LEFT JOIN processing_steps k      ON k.idempotency_key = 'MHAACK:'  || a.ack || ':' || p.job_id
+LEFT JOIN LATERAL (
+    SELECT jsonb_agg(jsonb_build_object('status', hs.status, 'amount',
+                                        hs.request_payload ->> 'amount', 'at', hs.created_at)) AS holds
+    FROM processing_steps hs
+    WHERE hs.complaint_id = c.id AND hs.step = 'HOLD'
+) h ON true
+ORDER BY a.ack;

@@ -161,10 +161,12 @@ def test_upi_debit_with_small_incident_keeps_contract(gw):
     assert logs[0].acknowledgement_mha["statuscode"] == "00"   # MHA ack stored
 
 
-def test_ib_debit_with_empty_cbdoc_keeps_blank_bene(gw):
+def test_ib_debit_with_empty_cbdoc_is_pending_not_blank_success(gw):
     gw.history = [txn([UTR], "-1000.00", "2026-06-09T10:00:00+05:30")]
-    gw.cbdoc_rows = []                                   # not in CBDOC yet: unchanged behaviour
+    gw.cbdoc_rows = []                                   # not in CBDOC yet (T+1)
     seed()
     run()
     [obj] = _only_response(gw)["transactions"]
-    assert obj["status_code"] == "00" and obj["payee_account_number"] == ""
+    assert (obj["status_code"], obj["remarks"]) == ("31", "Pending")
+    assert "payee_account_number" not in obj             # no blank-bene "success"
+    assert state()[1][0].response_code == "31"

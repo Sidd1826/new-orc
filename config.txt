@@ -178,8 +178,10 @@ CBDOC_RETRY_HOUR_IST = _env_int("CBDOC_RETRY_HOUR_IST", 10)
 
 # --- MHA response encryption (AES-256-CBC) ---
 # Base64-encoded 32-byte key. Loaded from Secret Manager on Cloud Run; never
-# hard-code it. If empty, encryption is skipped (dev/local only).
+# hard-code it. If empty, the send fails (retried -> NEEDS_REVIEW) unless
+# MHA_DEV_MODE=true explicitly allows skipping it for local development.
 MHA_RESPONSE_KEY_B64 = _env("MHA_RESPONSE_KEY_B64", "")
+MHA_DEV_MODE         = _env_bool("MHA_DEV_MODE", False)
 # Gateway endpoint that forwards the encrypted response to MHA.
 MHA_RESPONSE_PATH = _env("MHA_RESPONSE_PATH", "/api/v1/mha-response")
 

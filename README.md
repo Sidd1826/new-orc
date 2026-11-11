@@ -76,7 +76,8 @@ purpose (the response table).
 |`local_setup.sql`        |Recreates the **shared** schema.txt tables on a *blank* local DB. Skip it if your DB already has those tables.                     |
 |`orchestrator_tables.sql`|Creates the **two owned** tables (`complaint_processing`, `processing_steps`). Run this against your DB — it’s safe and idempotent.|
 |`seed.sql`               |Inserts ONE complaint (simulating the other service) for a quick smoke test.                                                       |
-|`seed_tests.sql`         |Inserts **10 labelled test complaints**, one per code path (see section 8).                                                        |
+|`seed_tests.sql`         |Inserts labelled test complaints (TC01–TC10 and the I4C-MHA sheet cases); re-runnable, see its header for expected outcomes.       |
+|`diagnostics.sql`        |`models/diagnostics.txt`: READ-ONLY queries joining complaints, processing, steps and response logs for given acknowledgement numbers.|
 
 ### Testing / ops
 
@@ -121,8 +122,13 @@ What happens in each state:
 - `D` = total disputed (sum of all incidents’ disputed_amount), `B` = balance.
 - Hold `min(D, B)`. Remaining `R = D - min(D, B)`.
 - The hold is **idempotent**: guarded by a `UNIQUE idempotency_key`
-  (`HOLD:<ack>:<account>:<amount>`) in `processing_steps`. A retry that finds a
-  prior success **skips the call** — a customer is never double-held.
+  (`HOLD:<ack>:<account>:<amount>`) in `processing_steps`, claimed and
+  **committed as PENDING before** apply-hold is called. A retry that finds any
+  prior SUCCESS hold for the complaint (whatever amount it was keyed on)
+  **skips the call**. A PENDING one (timeout, 5xx, crash, or an HTTP 200 whose
+  `data.status` isn't SUCCESS) is an **unknown outcome**: it is never replayed
+  and parks in NEEDS_REVIEW for reconciliation with the bank. Only a 4xx
+  rejection (nothing held) may be retried.
 1. **HOLD_APPLIED -> …**
 - If `R == 0` (balance covered everything) -> finalize -> **RESOLVED**.
 - If `R > 0` (partial hold, or no balance) -> **RECONCILING**.
@@ -154,10 +160,26 @@ Written to `api_response_logs.response_payload` as:
 |Code|Remarks           |When                                                                 |
 |----|------------------|---------------------------------------------------------------------|
 |`00`|                  |success                                                              |
-|`01`|`Record not found`|the gateway answers HTTP 404 for the payer account, or its DD transaction enquiry has no transactions|
-|`12`|`Invalid account number` / `Invalid input`|account is not exactly 12 digits, or an incident lacks amount / date / UTR|
-|`02`|`Invalid RRN`     |UTR/RRN not among the account's DD transactions, or no CBDOC row dated like the UTR|
-|`31`|`Pending`         |the matched DD record is IMPS or ATM (incident or reconcile leg), or the UPI API returns no beneficiary|
+|`01`|`Record not found`|the gateway answers HTTP 404 for the payer account (not its framework `{"detail":"Not Found"}` route 404), or the DD enquiry returns its documented shape with an empty transaction list|
+|`12`|`Invalid account number` / `Invalid input`|account is not exactly 12 ASCII digits (checked in the worker, since production ingestion bypasses Pydantic), or an incident lacks amount / date / UTR|
+|`02`|`Invalid RRN`     |the account HAS records but the UTR/RRN is not among them, or no CBDOC row dated like the UTR. Never for an absent account (that is `01`)|
+|`31`|`Pending`         |the matched DD record is IMPS or ATM, the UPI API returns no beneficiary or rejects the RRN with a 4xx, or the beneficiary is not in CBDOC yet|
+
+**Gateway failures are never a business code.** Timeouts, network errors,
+5xx, 401/403/408/429, a route-missing 404, and HTTP-200 bodies that are not
+the documented shape (error envelopes, HTML, `{}`) raise, are retried up to
+`MAX_ATTEMPTS`, and then park in NEEDS_REVIEW with `last_error` — no response,
+no callback. They are never turned into `01`, `02` or IMPS/`31`.
+
+**Stored summary** (`api_response_logs.response_code` / `response_message`,
+and so the generated `is_success`) is derived in one place,
+`processor._business_result`, from the final transaction objects — including
+the `<= 500` type-17 objects appended at logging time. MHA only sees the
+per-object codes; the summary is ours. Precedence: `12` > `01` > `02`
+(FAILURE, pipeline order) > `31` (PENDING) > `00` (SUCCESS only when every
+object is `00` and the complaint completed). Mixed `00`+`31` is `31`; an
+unreconciled trace or an empty object list is `31`; unknown codes raise.
+`is_success` is therefore "business success", not "received" or "delivered".
 
 Every flow (UPI debit, IB debit, credit) first looks each RRN/UTR up in the
 payer account's own DD transaction enquiry, from the reported transaction date.
@@ -174,12 +196,38 @@ embedded in a 22-char NEFT/RTGS UTR (`HSBCN5` + `yyyyMMdd` + serial). Identical
 rows collapse to one; several different rows park the complaint in
 NEEDS_REVIEW rather than picking one.
 
-The callback to MHA is sent at most once per `acknowledgement_no` + `job_id`:
-the `MHA_RESPONSE` step row is claimed atomically before sending. A failed send
-is retried on the next tick (up to `MAX_ATTEMPTS`). If a process dies mid-send
-the outcome is unknown, so it is not re-sent and ends in NEEDS_REVIEW.
+The callback to MHA is sent at most once per `acknowledgement_no` + `job_id`
+by this service: the `MHA_RESPONSE` step row is claimed and committed before
+sending. A failed send is retried on the next tick (up to `MAX_ATTEMPTS`). If
+a process dies mid-send the outcome is unknown, so it is not re-sent and ends
+in NEEDS_REVIEW. (This is at-most-once on our side only; it is not
+exactly-once delivery — MHA's side has no idempotency key we can use.)
 
-Tests: `pip install -r requirements.txt pytest` then `pytest tests`.
+Business completion, delivery and acceptance are separate:
+
+|What                |Where                                                         |
+|--------------------|--------------------------------------------------------------|
+|business result     |`api_response_logs.response_code` (summary) + payload codes   |
+|processing          |`complaint_processing.processing_state` / `last_error`        |
+|delivery (HTTP 2xx) |`processing_steps` step `MHA_RESPONSE`                        |
+|MHA acceptance      |`processing_steps` step `MHA_ACK` (SUCCESS = ack `statuscode` `00` naming our job_id; FAILURE = rejected; PENDING = no/undecryptable ack or another job's) + `acknowledgement_mha` on our own row only|
+
+A rejected or unconfirmed acceptance is logged as an error and left for ops;
+it is not auto-resent. If `MHA_RESPONSE_KEY_B64` is unset the send FAILS
+(retried, then NEEDS_REVIEW with the reason in `last_error`) unless
+`MHA_DEV_MODE=true` explicitly allows skipping it locally.
+
+**Receipt rows are not ours.** The ingest service writes a receipt row into
+`api_response_logs` when MHA's complaint arrives (code `00`, no
+`complaint_id`, no payload, its own `job_id`). This service never writes,
+matches or overwrites those rows; its final row uses `complaint_processing.job_id`.
+A receipt's `is_success = true` only means "received". `models/diagnostics.txt`
+(read-only) separates the two for any acknowledgement numbers.
+
+Tests: `pip install -r requirements.txt pytest` then `pytest tests` (SQLite).
+To also run the isolated PostgreSQL integration suite, point it at a server it
+may create and drop a throwaway `orc_it_*` database on:
+`ORC_TEST_PG_URL=postgresql+pg8000://USER:PASS@HOST:5432/postgres pytest tests`.
 
 ### Every external call is recorded
 
@@ -193,6 +241,8 @@ both the audit trail and the idempotency / resume mechanism:
 |`DD_TXN`     |the per-incident match of a transaction by RRN  |
 |`DD_ENQUIRY` |balance enquiry                                 |
 |`HOLD`       |apply-hold (the idempotency guard lives here)   |
+|`MHA_RESPONSE`|callback delivery (claimed before sending)     |
+|`MHA_ACK`    |MHA's verdict on the delivered callback         |
 |`BQ_TRACE`   |CBDOC/BigQuery search (locate + account debits) |
 
 -----
@@ -207,6 +257,10 @@ both the audit trail and the idempotency / resume mechanism:
 1. **Claim** — `SELECT ... FOR UPDATE SKIP LOCKED` the non-terminal, lease-free
    rows (oldest first, up to `BATCH_SIZE`), set a lease, assign a `job_id`.
 1. **Process** each claimed row in its own transaction through the state machine.
+
+`POST /process/{ack_no}` claims through the same lease, so it never runs
+alongside a batch worker; it answers `claimed: false` (with the current state)
+when the row is terminal, leased, backing off or out of attempts.
 
 Anything stuck (instance died mid-process, lease expired) is naturally re-picked
 on the next tick — no separate sweeper needed. In production, Cloud Scheduler
@@ -232,6 +286,7 @@ calls this every 1-2 minutes.
 |`HOLD_TYPE` `HOLD_TILL_DATE` `HOLD_CURRENCY`        |mandatory apply-hold fields.                                                                        |`F` / `2099-12-31` / `INR`                  |
 |`BQ_FIELD_REF/AMOUNT/DATE/TIME/ACCOUNT/BENE_ACCOUNT`|CBDOC column names used for matching/sorting/tracing.                                               |`OGTRNO/OGPYAM/OGCPDT/OGCPTM/OGBEAC/OGBEAC` |
 |`CBDOC_MAX_ROWS`                                    |cap on debits pulled per account.                                                                   |500                                         |
+|`MHA_RESPONSE_KEY_B64` / `MHA_DEV_MODE`             |AES key for the callback. Unset key = the send fails visibly, unless `MHA_DEV_MODE=true` (local only). |— / false                                   |
 
 
 > **To confirm against real data:** `BQ_FIELD_ACCOUNT` must be the CBDOC column
@@ -315,19 +370,23 @@ FROM api_response_logs l, jsonb_array_elements(l.response_payload->'transactions
 GROUP BY 1 ORDER BY 1;
 ```
 
-### Reset and re-run
+### Re-run
 
-```sql
-TRUNCATE complaints, instruments, incidents,
-         complaint_processing, processing_steps, api_response_logs
-RESTART IDENTITY CASCADE;
-```
-
-then re-run `seed_tests.sql`.
+`seed_tests.sql` is re-runnable (`ON CONFLICT DO NOTHING`), so just run it
+again. Never TRUNCATE: these tables are shared with the ingest service. To
+start from scratch, use a fresh local database.
 
 -----
 
 ## 8. The 10 test cases — step by step
+
+> **Outdated walkthrough.** TC01–TC09 use accounts like `ACC-FULL-0001`, which
+> the 12-digit account check now rejects: each ends NEEDS_REVIEW with
+> `12 / Invalid account number` before any gateway call (TC10 is unchanged).
+> The steps below describe the flow for a valid account. The I4C-MHA sheet
+> cases `3160823000011`–`16` (+ the corrected `3160823000015C`) at the bottom
+> of `seed_tests.sql` exercise the current paths; their expected codes are
+> listed there and asserted in `tests/test_pg_integration.py`.
 
 The mock gateway makes outcomes deterministic by deriving behaviour from the
 **account number**: `BALANCES[account]` sets the balance the balance-enquiry
@@ -425,7 +484,7 @@ gcloud run deploy fraud-ops-orchestrator \
   --source . --region "$REGION" --no-allow-unauthenticated \
   --add-cloudsql-instances "$PROJECT:$REGION:$INSTANCE" \
   --set-env-vars "PG_HOST=/cloudsql/$PROJECT:$REGION:$INSTANCE,PG_PORT=5432,PG_DB=$DB,GATEWAY_BASE_URL=$GATEWAY_URL,USE_OIDC_AUTH=true,GATEWAY_AUDIENCE=$GATEWAY_URL" \
-  --set-secrets "PG_USER=PG_USER:latest,PG_PASSWORD=PG_PASSWORD:latest"
+  --set-secrets "PG_USER=PG_USER:latest,PG_PASSWORD=PG_PASSWORD:latest,MHA_RESPONSE_KEY_B64=MHA_RESPONSE_KEY_B64:latest"
 
 # The polling tick (free cron). Its service account needs run.invoker on this service.
 gcloud scheduler jobs create http fraud-ops-tick \
