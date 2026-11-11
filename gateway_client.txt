@@ -12,6 +12,8 @@ X-HSBC-Sensitive-Data body, shaped [{"key": <token>, "value": <real account>}].
 """
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -128,8 +130,11 @@ class GatewayClient:
 
         log.info("GW <- %s %s status=%d", method, path, resp.status_code)
         if not resp.is_success:
+            # The gateway's reason (e.g. which field a 400 rejected) goes into
+            # last_error and the log; long digit runs are masked (account numbers).
+            reason = re.sub(r"\d{6,}", "***", json.dumps(data, default=str))[:300]
             raise GatewayError(
-                f"Gateway {path} returned {resp.status_code}",
+                f"Gateway {method} {path} returned {resp.status_code}: {reason}",
                 status_code=resp.status_code, body=data,
             )
         return data

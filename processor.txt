@@ -654,12 +654,21 @@ def _contract_rejection(e: GatewayError) -> bool:
             and not _route_missing(e))
 
 
+def _hub_unknown_account(e: GatewayError) -> bool:
+    """HUB's answer for an account it doesn't hold: 400, detail 'Invalid account number'.
+    Any other 400 (wrong method, parameter, date) is a request fault and is retried."""
+    detail = _find_key(e.body, "detail")
+    return (e.status_code == 400 and isinstance(detail, str)
+            and detail.strip().lower() == "invalid account number")
+
+
 def _account_call(call):
-    """Run an account-level gateway call; HTTP 404 means the account doesn't exist."""
+    """Run an account-level gateway call. HTTP 404, or HUB's 400 'Invalid account
+    number', means the account doesn't exist (-> 01)."""
     try:
         return call()
     except GatewayError as e:
-        if e.status_code == 404 and not _route_missing(e):
+        if (e.status_code == 404 and not _route_missing(e)) or _hub_unknown_account(e):
             raise AccountNotFound(str(e)) from e
         raise
 

@@ -1,17 +1,17 @@
-# Graph Report - orc  (2026-11-10)
+# Graph Report - orc  (2026-11-11)
 
 ## Corpus Check
-- 13 files · ~35,122 words
+- 13 files · ~35,303 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 1 file(s) not represented in the graph (top: (none) 1)
 
 ## Summary
-- 543 nodes · 1255 edges · 21 communities (18 shown, 3 thin omitted)
+- 544 nodes · 1256 edges · 21 communities (18 shown, 3 thin omitted)
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 127 edges (avg confidence: 0.86)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `ae211528`
+- Built from commit: `7650d42d`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -56,10 +56,10 @@
   bank_codes.py → config.txt
 - `_leg_bank_code()` --calls--> `resolve_from_narratives()`  [EXTRACTED]
   processor.txt → bank_codes.py
+- `graphify Usage Rules` --references--> `Fraud-Ops Orchestrator`  [AMBIGUOUS]
+  CLAUDE.md → README.md
 - `Channel by RRN Shape` --conceptually_related_to--> `Resumable Processing State Machine`  [AMBIGUOUS]
   classifier.txt → README.md
-- `_load_secrets_from_gcp()` --semantically_similar_to--> `_load_secrets_from_gcp()`  [INFERRED] [semantically similar]
-  configv2.txt → config.txt
 
 ## Import Cycles
 - None detected.
@@ -122,7 +122,7 @@ Cohesion: 0.25
 Nodes (13): cbdoc_row(), test_distinct_matching_records_raise(), test_flow_conflict_goes_to_review_without_callback(), test_flow_duplicates_give_one_response_object(), test_flow_no_dated_record_returns_02(), test_flow_picks_the_dated_record(), test_identical_records_are_deduplicated(), test_malformed_ogtmz1_never_matches_or_raises() (+5 more)
 
 ### Community 13 - "test_mock_gateway_contract.py"
-Cohesion: 0.14
+Cohesion: 0.13
 Nodes (3): frozen_clock(), real_gw(), Recording
 
 ### Community 14 - "test_pg_integration.py"
@@ -152,16 +152,16 @@ Nodes (3): NAME_ALIASES, _norm(), _tokens()
 ## Ambiguous Edges - Review These
 - `_run_state_machine()` → `_trace_and_collect()`  [AMBIGUOUS]
   processor.txt · relation: conceptually_related_to
+- `graphify Usage Rules` → `Fraud-Ops Orchestrator`  [AMBIGUOUS]
+  CLAUDE.md · relation: references
 - `Channel by RRN Shape` → `Resumable Processing State Machine`  [AMBIGUOUS]
   classifier.txt · relation: conceptually_related_to
 - `FastAPI app (Fraud-Ops Orchestrator)` → `MOCK HSBC MHA Gateway app`  [AMBIGUOUS]
   mock_gateway.txt · relation: semantically_similar_to
-- `graphify Usage Rules` → `Fraud-Ops Orchestrator`  [AMBIGUOUS]
-  CLAUDE.md · relation: references
 
 ## Knowledge Gaps
 - **31 isolated node(s):** `_LEG_STATUS`, `Miscellaneous Response to MHA`, `Classification`, `ApiResponseStatus enum`, `STATUS_OPEN` (+26 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 147 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 148 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
 - **3 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
@@ -183,5 +183,5 @@ _AMBIGUOUS edges — the extractor was unsure. Verify before acting on these._
 
 - **What is the exact relationship between `_run_state_machine()` and `_trace_and_collect()`?**
   _Edge tagged AMBIGUOUS (relation: conceptually_related_to) - confidence is low._
-- **What is the exact relationship between `Channel by RRN Shape` and `Resumable Processing State Machine`?**
-  _Edge tagged AMBIGUOUS (relation: conceptually_related_to) - confidence is low._
+- **What is the exact relationship between `graphify Usage Rules` and `Fraud-Ops Orchestrator`?**
+  _Edge tagged AMBIGUOUS (relation: references) - confidence is low._

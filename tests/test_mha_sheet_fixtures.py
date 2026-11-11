@@ -90,11 +90,20 @@ def test_0011_valid_upi_transaction_returns_00(gw):
     assert ack.status == "SUCCESS" and log.acknowledgement_mha["statuscode"] == "00"
 
 
-@pytest.mark.parametrize("absence", ["http_404", "documented_empty_history"])
+HUB_INVALID_ACCOUNT = {"type": "USS5000", "status": 400, "detail": "Invalid account number",
+                       "instance": "550e8400-e29b-41d4-a716-446655440000",
+                       "sourceDetails": {"applicationName": "HUB-IN",
+                                         "layerType": "BACKEND_SYSTEM"}}
+
+
+@pytest.mark.parametrize("absence", ["http_404", "documented_empty_history", "hub_400"])
 def test_0012_account_absent_returns_01(gw, absence):
     if absence == "http_404":
         gw.errors["transaction_history"] = GatewayError("account not found", status_code=404,
                                                         body={"errors": [{"code": "NF"}]})
+    if absence == "hub_400":
+        gw.errors["transaction_history"] = GatewayError("bad request", status_code=400,
+                                                        body=HUB_INVALID_ACCOUNT)
     seed_sheet("3160823000012")
     run()
     p, log, [obj] = outcome(gw, "3160823000012")
@@ -359,6 +368,8 @@ ROUTE_404 = GatewayError("no route", status_code=404, body={"detail": "Not Found
     GatewayError("Gateway network error: ReadTimeout"),            # 502 default
     GatewayError("unauthorised", status_code=401),
     ROUTE_404,
+    GatewayError("bad request", status_code=400,                   # any other 400
+                 body={**HUB_INVALID_ACCOUNT, "detail": "fromDate is not a valid field"}),
     {"errors": [{"code": "E500"}]},                                # HTTP-200 app error
     {"raw": "<html>bad gateway</html>"},                           # malformed body
     {},

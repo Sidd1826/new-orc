@@ -84,3 +84,13 @@ def test_gateway_failures_are_retried_never_a_business_code(real_gw, account):
     run()
     p, logs, _ = state("3160823000011")
     assert logs == [] and real_gw.sent == [] and p.attempt_count == 1
+
+
+def test_a_rejected_request_says_why_without_the_account(real_gw):
+    import httpx
+    real_gw._http = httpx.Client(base_url="http://gw", transport=httpx.MockTransport(
+        lambda r: httpx.Response(400, json={"detail": "fromDate not allowed", "acct": KNOWN})))
+    with pytest.raises(gateway_client.GatewayError) as e:
+        real_gw.transaction_history(KNOWN, from_date="2026-11-04")
+    assert e.value.status_code == 400 and "fromDate not allowed" in str(e.value)
+    assert KNOWN not in str(e.value) and "GET /api/v1/transactions/history" in str(e.value)
