@@ -67,9 +67,9 @@ def test_upi_request_and_bene_shapes_line_up(real_gw):
 
 
 def test_history_honours_the_start_date_parameter(real_gw):
-    out = real_gw.transaction_history(KNOWN, from_date="2026-11-05")
+    out = real_gw.transaction_history("INHSBC" + KNOWN, from_date="2026-11-05")
     assert out["data"]["accountInformation"]["transactionDetails"] == []
-    out = real_gw.transaction_history(KNOWN, from_date="2026-11-04")
+    out = real_gw.transaction_history("INHSBC" + KNOWN, from_date="2026-11-04")
     assert len(out["data"]["accountInformation"]["transactionDetails"]) == 3
 
 
@@ -91,6 +91,12 @@ def test_a_rejected_request_says_why_without_the_account(real_gw):
     real_gw._http = httpx.Client(base_url="http://gw", transport=httpx.MockTransport(
         lambda r: httpx.Response(400, json={"detail": "fromDate not allowed", "acct": KNOWN})))
     with pytest.raises(gateway_client.GatewayError) as e:
-        real_gw.transaction_history(KNOWN, from_date="2026-11-04")
+        real_gw.transaction_history("INHSBC" + KNOWN, from_date="2026-11-04")
     assert e.value.status_code == 400 and "fromDate not allowed" in str(e.value)
     assert KNOWN not in str(e.value) and "GET /api/v1/transactions/history" in str(e.value)
+
+
+def test_mock_history_rejects_bare_digits_like_hub(real_gw):
+    with pytest.raises(gateway_client.GatewayError) as e:
+        real_gw.transaction_history(KNOWN, from_date="2026-11-04")
+    assert e.value.status_code == 400 and "Invalid account number" in str(e.value)

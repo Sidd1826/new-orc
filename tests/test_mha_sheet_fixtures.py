@@ -188,7 +188,7 @@ def test_all_six_in_one_batch(gw):
     real = gw.transaction_history
 
     def history(account, from_date=None, to_date=None):
-        if account == "999999999999":
+        if account == "INHSBC999999999999":
             gw.calls.append(("transaction_history", {"account": account}))
             raise GatewayError("account not found", status_code=404)
         return real(account, from_date)
@@ -344,7 +344,7 @@ def test_direct_db_ingestion_keeps_string_account_and_validates_in_worker(gw):
     assert by_ack["DIRECT0000001"]["root_account_number"] == "003240868006"
     assert (by_ack["DIRECT0000002"]["status_code"],
             by_ack["DIRECT0000002"]["root_account_number"]) == ("12", "3240868006")
-    assert [kw["account"] for n, kw in gw.calls if n == "transaction_history"] == [KNOWN]
+    assert [kw["account"] for n, kw in gw.calls if n == "transaction_history"] == ["INHSBC" + KNOWN]
 
 
 def test_pydantic_ingest_keeps_account_string_and_scheme_metadata(gw):
@@ -670,3 +670,24 @@ def test_concurrent_claims_never_share_a_complaint(gw):
         t.join(30)
     claimed = [pid for ids in got for pid in ids]
     assert len(claimed) == len(set(claimed)) == len(SHEET)
+
+
+# --- HUB account format (prod 2026-11-15: bare digits -> 400 'Invalid account number') ---
+
+@pytest.mark.parametrize("as_sent", [KNOWN, "INHSBC" + KNOWN, "inhsbc" + KNOWN])
+def test_history_is_asked_with_the_hub_prefixed_account(gw, as_sent):
+    gw.history = [sheet_txn(["UPI", "630818826981", "P2A"], "3160823000011")]
+    seed_sheet("3160823000011", account=as_sent)
+    run()
+    _, log, [obj] = outcome(gw, "3160823000011")
+    assert log.response_code == "00" and obj["root_account_number"] == as_sent  # echoed as received
+    [(_, kw)] = [c for c in gw.calls if c[0] == "transaction_history"]
+    assert kw["account"] == "INHSBC" + KNOWN
+
+
+@pytest.mark.parametrize("bad", ["INHSBC" + KNOWN[:10], "INHSBC" + KNOWN + "1", "INSBI" + KNOWN])
+def test_prefixed_account_still_needs_exactly_12_digits(gw, bad):
+    seed_sheet("3160823000011", account=bad)
+    run()
+    _, log, _ = outcome(gw, "3160823000011")
+    assert log.response_code == "12" and gw.names() == ["mha_response"]

@@ -22,7 +22,7 @@ def _only_response(gw):
     "12345",                    # too short
     "0063611410012",            # 13 digits
     "00636114100A",             # non-numeric
-    "INHSBC006361141001",       # HSBC-prefixed form
+    "INHSBC00636114100",        # HSBC-prefixed, 11 digits
     " 006361141001",            # padded
     "",                         # empty
     "٠٠٦٣٦١١٤١٠٠١",             # 12 non-ASCII (Arabic-Indic) digits
@@ -61,7 +61,7 @@ def test_leading_zeros_are_kept_end_to_end(gw):
     assert p.processing_state == "RESOLVED"
     [(_, upi)] = [c for c in gw.calls if c[0] == "upi_bene_lookup"]
     assert upi["account_number"] == "000000000012"
-    assert [kw["account"] for n, kw in gw.calls if n == "transaction_history"] == ["000000000012"]
+    assert [kw["account"] for n, kw in gw.calls if n == "transaction_history"] == ["INHSBC000000000012"]
     assert _only_response(gw)["transactions"][0]["root_account_number"] == "000000000012"
 
 

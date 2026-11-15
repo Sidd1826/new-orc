@@ -4,7 +4,8 @@ mock_gateway.py — a fake HSBC MHA Gateway for LOCAL testing only.
 Speaks exactly what gateway_client.py sends and processor.py reads:
   GET  /api/v1/accounts/demand-deposit   body {"sensitiveData":[{"key","value"}]}
        -> data.accounts[0].availableBalance.amount       (config.BALANCE_PATH)
-  GET  /api/v1/transactions/history      ?transactionStartDate=YYYY-MM-DD + same body
+  GET  /api/v1/transactions/history      ?transactionStartDate=YYYY-MM-DD + same body,
+       account as INHSBC+12 digits (bare digits -> 400 Invalid account number)
        -> data.accountInformation.transactionDetails[]  (RRN in a narrative)
   POST /api/v1/accounts/apply-hold       {"applyHoldDetails": {...}} -> data.status
   POST /api/v1/upi/secure                {"systemId", "payload": {"rrn", "accNo", ...}}
@@ -110,6 +111,11 @@ async def demand_deposit(hubCustomerNumber: str = "", body: Any = Body(default=N
 async def transaction_history(accountNumber: str = "", transactionStartDate: str = "",
                               body: Any = Body(default=None)):
     account = _account(body)
+    if account is not None:                  # like HUB: only the prefixed form is known
+        if not account.startswith("INHSBC"):
+            return JSONResponse({"type": "USS5000", "status": 400,
+                                 "detail": "Invalid account number"}, status_code=400)
+        account = account[len("INHSBC"):]
     if (err := _special(account)) is not None:
         return err
     txns = [t for t in HISTORY.get(account, HISTORY[FIXTURE_ACCOUNT])

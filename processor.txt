@@ -240,7 +240,7 @@ def _process_one(processing_id: int) -> str:
                 return p.processing_state if p else "MISSING"
             try:
                 _run_state_machine(s, p)
-            except AccountNotFound:
+            except AccountNotFound as e:
                 s.rollback()
                 incidents = p.complaint.instrument.incidents
                 small = [i for i in incidents if _is_small(i)]
@@ -248,7 +248,7 @@ def _process_one(processing_id: int) -> str:
                     _stash_small_txns(s, p, small)
                 _finalize_miscellaneous(s, p, [i for i in incidents if not _is_small(i)],
                                         "Record not found", MHA_RECORD_NOT_FOUND)
-                _to_review(s, p, "account not found (gateway 404)")
+                _to_review(s, p, f"account not found: {e}"[:1000])
             except CbdocConflict as e:
                 s.rollback()
                 _to_review(s, p, str(e))
@@ -465,7 +465,17 @@ def _to_review(s: Session, p: ComplaintProcessing, reason: str) -> None:
     log.error("[%s] -> NEEDS_REVIEW: %s", p.acknowledgement_no, reason)
 
 
-_ACCOUNT_RE = re.compile(r"[0-9]{12}")   # a string match, so leading zeros survive
+# MHA sends the 12 digits, with or without HUB's country+bank prefix. A string
+# match, so leading zeros survive.
+HUB_ACCOUNT_PREFIX = "INHSBC"
+_ACCOUNT_RE = re.compile(rf"(?:{HUB_ACCOUNT_PREFIX})?[0-9]{{12}}", re.IGNORECASE)
+
+
+def _hub_account(account: str) -> str:
+    """HUB transaction history only knows the prefixed form (prod, 2026-11-15):
+    bare digits get 400 'Invalid account number'."""
+    digits = account.strip()[-12:]
+    return f"{HUB_ACCOUNT_PREFIX}{digits}"
 
 
 def _ack_only(instrument: Instrument, incidents: list[Incident]) -> bool:
@@ -680,7 +690,8 @@ def _txn_enquiry(s: Session, p: ComplaintProcessing, account: str, from_date: st
     existing = _step_get(s, p, "TXN_ENQUIRY", idem)
     if existing and existing.status == "SUCCESS":
         return existing.response_payload or {}
-    resp = _account_call(lambda: gateway().transaction_history(account, from_date=from_date))
+    resp = _account_call(lambda: gateway().transaction_history(_hub_account(account),
+                                                               from_date=from_date))
     _step_record(s, p, "TXN_ENQUIRY", idem,
                  {"account": account, "fromDate": from_date}, resp)
     return resp
