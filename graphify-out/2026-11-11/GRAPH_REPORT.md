@@ -1,7 +1,7 @@
 # Graph Report - orc  (2026-11-11)
 
 ## Corpus Check
-- 13 files · ~35,201 words
+- 13 files · ~35,303 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 1 file(s) not represented in the graph (top: (none) 1)
 

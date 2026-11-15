@@ -1,17 +1,17 @@
 # Graph Report - orc  (2026-11-11)
 
 ## Corpus Check
-- 13 files · ~35,303 words
+- 13 files · ~35,373 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 1 file(s) not represented in the graph (top: (none) 1)
 
 ## Summary
-- 544 nodes · 1256 edges · 21 communities (18 shown, 3 thin omitted)
+- 546 nodes · 1259 edges · 17 communities (14 shown, 3 thin omitted)
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 127 edges (avg confidence: 0.86)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `7650d42d`
+- Built from commit: `51c5979c`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -26,11 +26,7 @@
 - HSBC/UPI/BigQuery Config
 - run
 - conftest.py
-- FakeGateway
-- test_cbdoc_rows.py
-- test_mock_gateway_contract.py
 - test_pg_integration.py
-- test_response_idempotency.py
 - BankCodeRegistry
 - _create_conn_pool
 - _env
@@ -75,7 +71,7 @@
 - **Encrypted MHA response delivery** — encryption_encrypt_payload, gateway_client_gatewayclient_mha_response, test_mha_response, configv2_mha_response_url [INFERRED 0.85]
 - **Orchestrator sidecar processing pattern** — models_orc_tables_complaint_processing, models_orc_tables_processing_steps, models_orc_tables_idx_cp_poll, models_orc_tables_idempotency_key [INFERRED 0.85]
 
-## Communities (21 total, 3 thin omitted)
+## Communities (17 total, 3 thin omitted)
 
 ### Community 0 - "Complaint Processing Engine"
 Cohesion: 0.05
@@ -98,8 +94,8 @@ Cohesion: 0.07
 Nodes (25): _env_int(), FRAUD_AGE_THRESHOLD_HOURS, Processing settings (BATCH_SIZE/LEASE_SECONDS/MAX_ATTEMPTS), UPI_SYSTEM_ID, GatewayClient.apply_hold(), GatewayClient.bigquery_search(), GatewayClient.demand_deposit(), GatewayClient._request() (+17 more)
 
 ### Community 6 - "seed"
-Cohesion: 0.18
-Nodes (21): seed(), txn(), ib_debit(), upi_debit(), _fraud(), _result(), test_all_flows_check_the_record_before_any_lookup(), test_incoming_transaction_type_does_not_override_the_record() (+13 more)
+Cohesion: 0.11
+Nodes (42): incident(), seed(), state(), txn(), ib_debit(), test_account_absence_with_small_incident_is_01(), test_cbdoc_finalizer_summary_matches_its_object(), test_dd_probe_finalizer_found_returns_00() (+34 more)
 
 ### Community 7 - "HSBC/UPI/BigQuery Config"
 Cohesion: 0.18
@@ -107,31 +103,15 @@ Nodes (10): MHA_RESPONSE_PATH, BigQuery settings (BQ_PROJECT/DATASET/TABLE), _en
 
 ### Community 8 - "run"
 Cohesion: 0.07
-Nodes (69): incident(), run(), state(), _credit(), _hold_case(), outcome(), _receipt(), seed_sheet() (+61 more)
+Nodes (46): run(), _credit(), frozen_clock(), _hold_case(), outcome(), _receipt(), seed_sheet(), sheet_txn() (+38 more)
 
 ### Community 9 - "conftest.py"
-Cohesion: 0.12
-Nodes (4): _bigint(), _computed(), _jsonb(), _TxtModules
-
-### Community 11 - "FakeGateway"
-Cohesion: 0.19
-Nodes (3): engine(), FakeGateway, gw()
-
-### Community 12 - "test_cbdoc_rows.py"
-Cohesion: 0.25
-Nodes (13): cbdoc_row(), test_distinct_matching_records_raise(), test_flow_conflict_goes_to_review_without_callback(), test_flow_duplicates_give_one_response_object(), test_flow_no_dated_record_returns_02(), test_flow_picks_the_dated_record(), test_identical_records_are_deduplicated(), test_malformed_ogtmz1_never_matches_or_raises() (+5 more)
-
-### Community 13 - "test_mock_gateway_contract.py"
-Cohesion: 0.13
-Nodes (3): frozen_clock(), real_gw(), Recording
+Cohesion: 0.06
+Nodes (21): _bigint(), cbdoc_row(), _computed(), engine(), FakeGateway, gw(), _jsonb(), _TxtModules (+13 more)
 
 ### Community 14 - "test_pg_integration.py"
-Cohesion: 0.15
-Nodes (7): engine(), pg_url(), _run_sql_file(), test_concurrent_batch_ticks_process_each_complaint_once(), test_real_ddl_rejects_the_missing_date_workflow(), test_seed_sql_is_rerunnable_and_matches_its_expectations(), test_skip_locked_skips_a_row_another_transaction_holds()
-
-### Community 15 - "test_response_idempotency.py"
-Cohesion: 0.18
-Nodes (6): _load(), response_ready(), test_concurrent_send_while_first_is_in_flight(), worker(), test_simultaneous_sends_deliver_exactly_once(), worker()
+Cohesion: 0.07
+Nodes (18): real_gw(), Recording, engine(), pg_url(), _run_sql_file(), test_concurrent_batch_ticks_process_each_complaint_once(), test_real_ddl_rejects_the_missing_date_workflow(), test_seed_sql_is_rerunnable_and_matches_its_expectations() (+10 more)
 
 ### Community 16 - "BankCodeRegistry"
 Cohesion: 0.20
@@ -161,7 +141,7 @@ Nodes (3): NAME_ALIASES, _norm(), _tokens()
 
 ## Knowledge Gaps
 - **31 isolated node(s):** `_LEG_STATUS`, `Miscellaneous Response to MHA`, `Classification`, `ApiResponseStatus enum`, `STATUS_OPEN` (+26 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 148 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 149 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
 - **3 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
@@ -174,7 +154,7 @@ _Questions this graph is uniquely positioned to answer:_
 - **Should `Complaint Processing Engine` be split into smaller, more focused modules?**
   _Cohesion score 0.05293383270911361 - nodes in this community are weakly interconnected._
 - **Why does `_run_state_machine()` connect `Complaint Processing Engine` to `API Ingest & Classification`?**
-  _High betweenness centrality (0.175) - this node is a cross-community bridge._
+  _High betweenness centrality (0.174) - this node is a cross-community bridge._
 - **Should `API Ingest & Classification` be split into smaller, more focused modules?**
   _Cohesion score 0.0636734693877551 - nodes in this community are weakly interconnected._
 

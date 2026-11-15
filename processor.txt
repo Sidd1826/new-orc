@@ -657,7 +657,9 @@ def _contract_rejection(e: GatewayError) -> bool:
 def _hub_unknown_account(e: GatewayError) -> bool:
     """HUB's answer for an account it doesn't hold: 400, detail 'Invalid account number'.
     Any other 400 (wrong method, parameter, date) is a request fault and is retried."""
-    detail = _find_key(e.body, "detail")
+    # The internal gateway wraps HUB's body: {"detail": {..., "upstreamBody": {...}}}.
+    hub = _find_key(e.body, "upstreamBody") or e.body
+    detail = hub.get("detail") if isinstance(hub, dict) else None
     return (e.status_code == 400 and isinstance(detail, str)
             and detail.strip().lower() == "invalid account number")
 

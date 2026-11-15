@@ -96,7 +96,15 @@ HUB_INVALID_ACCOUNT = {"type": "USS5000", "status": 400, "detail": "Invalid acco
                                          "layerType": "BACKEND_SYSTEM"}}
 
 
-@pytest.mark.parametrize("absence", ["http_404", "documented_empty_history", "hub_400"])
+def _wrapped(hub_body):
+    """How mha-api-internal relays a HUB error (seen in UAT, 2026-11-11)."""
+    return {"detail": {"requestId": "r1", "error": "upstream_error",
+                       "message": "HSBC transaction_history returned 400",
+                       "upstreamStatus": 400, "upstreamBody": hub_body}}
+
+
+@pytest.mark.parametrize("absence", ["http_404", "documented_empty_history", "hub_400",
+                                     "hub_400_via_gateway"])
 def test_0012_account_absent_returns_01(gw, absence):
     if absence == "http_404":
         gw.errors["transaction_history"] = GatewayError("account not found", status_code=404,
@@ -104,6 +112,9 @@ def test_0012_account_absent_returns_01(gw, absence):
     if absence == "hub_400":
         gw.errors["transaction_history"] = GatewayError("bad request", status_code=400,
                                                         body=HUB_INVALID_ACCOUNT)
+    if absence == "hub_400_via_gateway":
+        gw.errors["transaction_history"] = GatewayError("bad request", status_code=400,
+                                                        body=_wrapped(HUB_INVALID_ACCOUNT))
     seed_sheet("3160823000012")
     run()
     p, log, [obj] = outcome(gw, "3160823000012")
@@ -370,6 +381,8 @@ ROUTE_404 = GatewayError("no route", status_code=404, body={"detail": "Not Found
     ROUTE_404,
     GatewayError("bad request", status_code=400,                   # any other 400
                  body={**HUB_INVALID_ACCOUNT, "detail": "fromDate is not a valid field"}),
+    GatewayError("bad request", status_code=400,                   # UAT: HUB detail ""
+                 body=_wrapped({**HUB_INVALID_ACCOUNT, "detail": ""})),
     {"errors": [{"code": "E500"}]},                                # HTTP-200 app error
     {"raw": "<html>bad gateway</html>"},                           # malformed body
     {},
