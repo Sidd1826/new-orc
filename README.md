@@ -282,7 +282,7 @@ calls this every 1-2 minutes.
 |`MAX_ATTEMPTS`                                      |retries before NEEDS_REVIEW.                                                                        |5                                           |
 |`BALANCE_PATH`                                      |dotted path to the balance amount in the gateway response.                                          |`data.accounts.0.currentBalance.amount`     |
 |`BALANCE_FIELD`                                     |deep-search fallback target if the path misses.                                                     |`currentBalance`                            |
-|`TXN_DETAILS_PATH`                                  |path to the transaction list in the enquiry response.                                               |`data.accountInformation.transactionDetails`|
+|`TXN_DETAILS_PATH`                                  |path to the transaction list in the enquiry response.                                               |`data.transactionDetails`                  |
 |`HOLD_TYPE` `HOLD_TILL_DATE` `HOLD_CURRENCY`        |mandatory apply-hold fields.                                                                        |`F` / `2099-12-31` / `INR`                  |
 |`BQ_FIELD_REF/AMOUNT/DATE/TIME/ACCOUNT/BENE_ACCOUNT`|CBDOC column names used for matching/sorting/tracing.                                               |`OGTRNO/OGPYAM/OGCPDT/OGCPTM/OGBEAC/OGBEAC` |
 |`CBDOC_MAX_ROWS`                                    |cap on debits pulled per account.                                                                   |500                                         |

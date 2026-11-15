@@ -130,7 +130,8 @@ class FakeGateway:
         # Like HSBC: only transactions on/after the requested start date.
         txns = [t for t in self.history
                 if not from_date or t["transactionId"]["executionTimestamp"][:10] >= from_date]
-        return {"data": {"accountInformation": {"transactionDetails": txns}}}
+        return {"data": {"accountInformation": {"accountCurrencyCode": "INR"},
+                         "transactionDetails": txns}}           # prod HUB shape
 
     def demand_deposit(self, account):
         self._call("demand_deposit", account=account)

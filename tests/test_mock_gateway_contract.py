@@ -39,6 +39,7 @@ def real_gw(gw, monkeypatch):           # gw: DB + encryption key; then swap the
 
 @pytest.mark.parametrize("ack,account,code", [
     ("3160823000011", None, "00"),
+    ("3160823000011", "INHSBC" + KNOWN, "00"),           # mock enforces per-API format
     ("3160823000012", None, "01"),                       # ABSENT_ACCOUNT -> HTTP 404
     ("3160823000013", None, "12"),
     ("3160823000014", None, "12"),
@@ -68,13 +69,13 @@ def test_upi_request_and_bene_shapes_line_up(real_gw):
 
 def test_history_honours_the_start_date_parameter(real_gw):
     out = real_gw.transaction_history("INHSBC" + KNOWN, from_date="2026-11-05")
-    assert out["data"]["accountInformation"]["transactionDetails"] == []
+    assert out["data"]["transactionDetails"] == []
     out = real_gw.transaction_history("INHSBC" + KNOWN, from_date="2026-11-04")
-    assert len(out["data"]["accountInformation"]["transactionDetails"]) == 3
+    assert len(out["data"]["transactionDetails"]) == 3
 
 
 def test_balance_is_at_the_configured_path(real_gw):
-    resp = real_gw.demand_deposit(KNOWN)
+    resp = real_gw.demand_deposit("INHSBC" + KNOWN)
     assert processor._dig(resp, config.BALANCE_PATH) == "76000.00"
 
 

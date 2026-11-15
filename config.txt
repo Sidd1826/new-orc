@@ -139,7 +139,8 @@ BALANCE_FIELD = _env("BALANCE_FIELD", "availableBalance")   # deep-search fallba
 UPI_SYSTEM_ID = _env_int("UPI_SYSTEM_ID", 403)
 
 # --- Transaction enquiry: path to the transaction list (also under "data") ---
-TXN_DETAILS_PATH = _env("TXN_DETAILS_PATH", "accountInformation.transactionDetails")
+# Prod HUB (2026-11-15): data.transactionDetails is a SIBLING of data.accountInformation.
+TXN_DETAILS_PATH = _env("TXN_DETAILS_PATH", "transactionDetails")
 
 # --- Apply-hold mandatory fields ---
 HOLD_TYPE      = _env("HOLD_TYPE", "F")            # per your sample (F)

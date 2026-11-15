@@ -691,3 +691,31 @@ def test_prefixed_account_still_needs_exactly_12_digits(gw, bad):
     run()
     _, log, _ = outcome(gw, "3160823000011")
     assert log.response_code == "12" and gw.names() == ["mha_response"]
+
+
+@pytest.mark.parametrize("as_sent", [KNOWN, "INHSBC" + KNOWN])
+def test_each_api_gets_the_account_in_its_own_format(gw, as_sent):
+    """Prod 2026-11-15: HUB (history, balance, hold) needs INHSBC+digits; UPI needs digits."""
+    _hold_case(gw)
+    with db.session_scope() as s:
+        s.execute(text("UPDATE instruments SET payer_account_number = :a"), {"a": as_sent})
+        s.commit()
+    run(3)
+    sent = {n: kw for n, kw in gw.calls}
+    assert sent["transaction_history"]["account"] == "INHSBC" + KNOWN
+    assert sent["demand_deposit"]["account"] == "INHSBC" + KNOWN
+    assert sent["apply_hold"]["account_number"] == "INHSBC" + KNOWN
+    if "upi_bene_lookup" in sent:
+        assert sent["upi_bene_lookup"]["account_number"] == KNOWN
+
+
+def test_upi_debit_sends_bare_digits_and_blank_payee_is_pending(gw):
+    gw.history = [sheet_txn(["UPI", "630818826981", "P2A"], "3160823000011")]
+    gw.upi_bene_lookup = lambda **kw: gw.calls.append(("upi_bene_lookup", kw)) or {
+        "data": dict.fromkeys(("pyAccNo", "pyFname", "txnDate", "bankName", "pyIfscCode"), "")}
+    seed_sheet("3160823000011", account="INHSBC" + KNOWN)
+    run()
+    _, log, [obj] = outcome(gw, "3160823000011")
+    [(_, kw)] = [c for c in gw.calls if c[0] == "upi_bene_lookup"]
+    assert kw["account_number"] == KNOWN
+    assert (obj["status_code"], log.response_code) == ("31", "31")   # never a blank-payee 00

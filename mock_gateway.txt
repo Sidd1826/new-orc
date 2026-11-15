@@ -5,8 +5,9 @@ Speaks exactly what gateway_client.py sends and processor.py reads:
   GET  /api/v1/accounts/demand-deposit   body {"sensitiveData":[{"key","value"}]}
        -> data.accounts[0].availableBalance.amount       (config.BALANCE_PATH)
   GET  /api/v1/transactions/history      ?transactionStartDate=YYYY-MM-DD + same body,
-       account as INHSBC+12 digits (bare digits -> 400 Invalid account number)
-       -> data.accountInformation.transactionDetails[]  (RRN in a narrative)
+       HUB APIs (history, demand-deposit, apply-hold) take INHSBC+12 digits (bare
+       digits -> 400 Invalid account number); UPI takes the bare 12 digits.
+       -> data.transactionDetails[] beside data.accountInformation (RRN in a narrative)
   POST /api/v1/accounts/apply-hold       {"applyHoldDetails": {...}} -> data.status
   POST /api/v1/upi/secure                {"systemId", "payload": {"rrn", "accNo", ...}}
        -> data.{pyAccNo, pyIfscCode, bankName, pyFname, txnDate}; {} if unknown
@@ -79,6 +80,15 @@ def _envelope(data: Any) -> dict:
     return {"requestId": str(uuid.uuid4()), "data": data}
 
 
+def _hub_account(body: Any) -> tuple[Optional[str], Optional[JSONResponse]]:
+    """HUB APIs know only INHSBC+12 digits; bare digits -> 400 like prod."""
+    account = _account(body)
+    if account is None or account.startswith("INHSBC"):
+        return (account[len("INHSBC"):] if account else None), None
+    return None, JSONResponse({"type": "USS5000", "status": 400,
+                               "detail": "Invalid account number"}, status_code=400)
+
+
 def _special(account: Optional[str]) -> Optional[JSONResponse]:
     if account is None:
         return JSONResponse({"detail": "sensitiveData missing"}, status_code=400)
@@ -98,8 +108,8 @@ async def health():
 
 @app.get("/api/v1/accounts/demand-deposit")
 async def demand_deposit(hubCustomerNumber: str = "", body: Any = Body(default=None)):
-    account = _account(body)
-    if (err := _special(account)) is not None:
+    account, err = _hub_account(body)
+    if err is not None or (err := _special(account)) is not None:
         return err
     bal = BALANCES.get(account, "100000.00")
     return _envelope({"accounts": [{"accountStatusDesc": "ACTIVE",
@@ -110,30 +120,32 @@ async def demand_deposit(hubCustomerNumber: str = "", body: Any = Body(default=N
 @app.get("/api/v1/transactions/history")
 async def transaction_history(accountNumber: str = "", transactionStartDate: str = "",
                               body: Any = Body(default=None)):
-    account = _account(body)
-    if account is not None:                  # like HUB: only the prefixed form is known
-        if not account.startswith("INHSBC"):
-            return JSONResponse({"type": "USS5000", "status": 400,
-                                 "detail": "Invalid account number"}, status_code=400)
-        account = account[len("INHSBC"):]
-    if (err := _special(account)) is not None:
+    account, err = _hub_account(body)
+    if err is not None or (err := _special(account)) is not None:
         return err
     txns = [t for t in HISTORY.get(account, HISTORY[FIXTURE_ACCOUNT])
             if t["transactionId"]["executionTimestamp"][:10] >= transactionStartDate]
-    return _envelope({"accountInformation": {"accountCurrencyCode": "INR", "moreTxns": "N",
-                                             "transactionDetails": txns}})
+    return _envelope({"accountInformation": {"accountCurrencyCode": "INR"},
+                      "moreTxns": "N", "transactionDetails": txns})
 
 
 @app.post("/api/v1/accounts/apply-hold")
 async def apply_hold(body: dict = Body(...)):
     d = body.get("applyHoldDetails", {})
+    if not str(d.get("accountNumber", "")).startswith("INHSBC"):
+        return JSONResponse({"type": "USS5000", "status": 400,
+                             "detail": "Invalid account number"}, status_code=400)
     return _envelope({"status": "SUCCESS", "holdReference": f"HOLD-{uuid.uuid4().hex[:10]}",
                       "heldAmount": d.get("holdAmount"), "accountNumber": d.get("accountNumber")})
 
 
 @app.post("/api/v1/upi/secure")
 async def upi_secure(body: dict = Body(...)):
-    rrn = str((body.get("payload") or {}).get("rrn", ""))
+    payload = body.get("payload") or {}
+    rrn = str(payload.get("rrn", ""))
+    if not str(payload.get("accNo", "")).isdigit():   # prod: INHSBC-prefixed -> blank payee
+        return _envelope(dict.fromkeys(("pyAccNo", "pyFname", "txnDate", "bankCode",
+                                        "bankName", "pyFvaddr", "pyIfscCode"), ""))
     return _envelope(UPI_BENE.get(rrn, {}))      # {} = the UPI switch has no beneficiary
 
 

@@ -1,17 +1,17 @@
 # Graph Report - orc  (2026-11-15)
 
 ## Corpus Check
-- 13 files · ~35,587 words
+- 13 files · ~35,863 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 1 file(s) not represented in the graph (top: (none) 1)
 
 ## Summary
-- 549 nodes · 1272 edges · 20 communities (19 shown, 1 thin omitted)
+- 552 nodes · 1282 edges · 20 communities (18 shown, 2 thin omitted)
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 128 edges (avg confidence: 0.86)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `8adbb043`
+- Built from commit: `77092ea6`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -22,11 +22,11 @@
 - _load_secrets_from_gcp
 - Local Schema & Migration
 - Gateway Client & Processing Settings
-- seed
+- run
 - test_cbdoc_rows.py
 - run
 - conftest.py
-- test_mock_gateway_contract.py
+- Recording
 - FakeGateway
 - ComplaintProcessing
 - test_pg_integration.py
@@ -37,16 +37,16 @@
 - ProcessingStep
 
 ## God Nodes (most connected - your core abstractions)
-1. `run()` - 82 edges
+1. `run()` - 84 edges
 2. `seed()` - 45 edges
 3. `state()` - 45 edges
 4. `txn()` - 36 edges
-5. `seed_sheet()` - 33 edges
+5. `seed_sheet()` - 34 edges
 6. `incident()` - 26 edges
 7. `_run_state_machine()` - 23 edges
 8. `_enrich()` - 18 edges
 9. `seed_tests.sql (10 labelled test complaints)` - 18 edges
-10. `_step_get()` - 17 edges
+10. `outcome()` - 17 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `MOCK HSBC MHA Gateway app` --semantically_similar_to--> `FastAPI app (Fraud-Ops Orchestrator)`  [AMBIGUOUS] [semantically similar]
@@ -74,7 +74,7 @@
 - **Encrypted MHA response delivery** — encryption_encrypt_payload, gateway_client_gatewayclient_mha_response, test_mha_response, configv2_mha_response_url [INFERRED 0.85]
 - **Orchestrator sidecar processing pattern** — models_orc_tables_complaint_processing, models_orc_tables_processing_steps, models_orc_tables_idx_cp_poll, models_orc_tables_idempotency_key [INFERRED 0.85]
 
-## Communities (20 total, 1 thin omitted)
+## Communities (20 total, 2 thin omitted)
 
 ### Community 0 - "Complaint Processing Engine"
 Cohesion: 0.05
@@ -100,25 +100,21 @@ Nodes (63): api_response_logs table, api_response_status enum, complaints table,
 Cohesion: 0.07
 Nodes (25): _env_int(), FRAUD_AGE_THRESHOLD_HOURS, Processing settings (BATCH_SIZE/LEASE_SECONDS/MAX_ATTEMPTS), UPI_SYSTEM_ID, GatewayClient.apply_hold(), GatewayClient.bigquery_search(), GatewayClient.demand_deposit(), GatewayClient._request() (+17 more)
 
-### Community 6 - "seed"
-Cohesion: 0.17
-Nodes (21): seed(), txn(), ib_debit(), upi_debit(), _fraud(), _result(), test_all_flows_check_the_record_before_any_lookup(), test_incoming_transaction_type_does_not_override_the_record() (+13 more)
+### Community 6 - "run"
+Cohesion: 0.09
+Nodes (56): incident(), run(), seed(), state(), txn(), ib_debit(), _credit(), _hold_case() (+48 more)
 
 ### Community 7 - "test_cbdoc_rows.py"
-Cohesion: 0.25
-Nodes (13): cbdoc_row(), test_distinct_matching_records_raise(), test_flow_conflict_goes_to_review_without_callback(), test_flow_duplicates_give_one_response_object(), test_flow_no_dated_record_returns_02(), test_flow_picks_the_dated_record(), test_identical_records_are_deduplicated(), test_malformed_ogtmz1_never_matches_or_raises() (+5 more)
+Cohesion: 0.23
+Nodes (14): cbdoc_row(), test_distinct_matching_records_raise(), test_flow_conflict_goes_to_review_without_callback(), test_flow_duplicates_give_one_response_object(), test_flow_no_dated_record_returns_02(), test_flow_picks_the_dated_record(), test_identical_records_are_deduplicated(), test_malformed_ogtmz1_never_matches_or_raises() (+6 more)
 
 ### Community 8 - "run"
-Cohesion: 0.06
-Nodes (73): incident(), run(), state(), _credit(), _hold_case(), outcome(), _receipt(), seed_sheet() (+65 more)
+Cohesion: 0.07
+Nodes (37): frozen_clock(), outcome(), _receipt(), seed_sheet(), sheet_txn(), step_rows(), test_0011_valid_upi_transaction_returns_00(), test_0012_account_absent_returns_01() (+29 more)
 
 ### Community 9 - "conftest.py"
 Cohesion: 0.12
 Nodes (4): _bigint(), _computed(), _jsonb(), _TxtModules
-
-### Community 11 - "test_mock_gateway_contract.py"
-Cohesion: 0.12
-Nodes (3): frozen_clock(), real_gw(), Recording
 
 ### Community 12 - "FakeGateway"
 Cohesion: 0.19
@@ -133,8 +129,8 @@ Cohesion: 0.15
 Nodes (7): engine(), pg_url(), _run_sql_file(), test_concurrent_batch_ticks_process_each_complaint_once(), test_real_ddl_rejects_the_missing_date_workflow(), test_seed_sql_is_rerunnable_and_matches_its_expectations(), test_skip_locked_skips_a_row_another_transaction_holds()
 
 ### Community 15 - "test_response_idempotency.py"
-Cohesion: 0.24
-Nodes (5): _load(), test_concurrent_send_while_first_is_in_flight(), worker(), test_simultaneous_sends_deliver_exactly_once(), worker()
+Cohesion: 0.18
+Nodes (8): _load(), test_concurrent_send_while_first_is_in_flight(), worker(), test_crash_mid_send_is_never_resent_and_parks_for_review(), test_failed_callback_is_retried_then_delivered_once(), test_reprocessing_after_delivery_never_resends(), test_simultaneous_sends_deliver_exactly_once(), worker()
 
 ### Community 16 - "Complaint"
 Cohesion: 0.27
@@ -155,17 +151,17 @@ Nodes (4): ProcessingStep, complaint_processing table, orchestrator_tables.sql, 
 ## Ambiguous Edges - Review These
 - `_run_state_machine()` → `_trace_and_collect()`  [AMBIGUOUS]
   processor.txt · relation: conceptually_related_to
-- `graphify Usage Rules` → `Fraud-Ops Orchestrator`  [AMBIGUOUS]
-  CLAUDE.md · relation: references
 - `Channel by RRN Shape` → `Resumable Processing State Machine`  [AMBIGUOUS]
   classifier.txt · relation: conceptually_related_to
+- `graphify Usage Rules` → `Fraud-Ops Orchestrator`  [AMBIGUOUS]
+  CLAUDE.md · relation: references
 - `FastAPI app (Fraud-Ops Orchestrator)` → `MOCK HSBC MHA Gateway app`  [AMBIGUOUS]
   mock_gateway.txt · relation: semantically_similar_to
 
 ## Knowledge Gaps
-- **31 isolated node(s):** `_LEG_STATUS`, `Miscellaneous Response to MHA`, `Classification`, `ApiResponseStatus enum`, `STATUS_OPEN` (+26 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 150 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **1 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **31 isolated node(s):** `_LEG_STATUS`, `Miscellaneous Response to MHA`, `Classification`, `TERMINAL_STATES / processing states`, `ApiResponseStatus enum` (+26 more)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 151 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **2 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
@@ -177,7 +173,7 @@ _Questions this graph is uniquely positioned to answer:_
 - **Should `Complaint Processing Engine` be split into smaller, more focused modules?**
   _Cohesion score 0.05293383270911361 - nodes in this community are weakly interconnected._
 - **Why does `_run_state_machine()` connect `Complaint Processing Engine` to `classify`, `ComplaintProcessing`?**
-  _High betweenness centrality (0.174) - this node is a cross-community bridge._
+  _High betweenness centrality (0.173) - this node is a cross-community bridge._
 - **Should `bank_codes.py` be split into smaller, more focused modules?**
   _Cohesion score 0.05203619909502263 - nodes in this community are weakly interconnected._
 
@@ -186,5 +182,5 @@ _AMBIGUOUS edges — the extractor was unsure. Verify before acting on these._
 
 - **What is the exact relationship between `_run_state_machine()` and `_trace_and_collect()`?**
   _Edge tagged AMBIGUOUS (relation: conceptually_related_to) - confidence is low._
-- **What is the exact relationship between `graphify Usage Rules` and `Fraud-Ops Orchestrator`?**
-  _Edge tagged AMBIGUOUS (relation: references) - confidence is low._
+- **What is the exact relationship between `Channel by RRN Shape` and `Resumable Processing State Machine`?**
+  _Edge tagged AMBIGUOUS (relation: conceptually_related_to) - confidence is low._

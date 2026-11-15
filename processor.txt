@@ -471,11 +471,15 @@ HUB_ACCOUNT_PREFIX = "INHSBC"
 _ACCOUNT_RE = re.compile(rf"(?:{HUB_ACCOUNT_PREFIX})?[0-9]{{12}}", re.IGNORECASE)
 
 
+def _upi_account(account: str) -> str:
+    """The UPI switch knows only the bare 12 digits (prod, 2026-11-15)."""
+    return account.strip()[-12:]
+
+
 def _hub_account(account: str) -> str:
-    """HUB transaction history only knows the prefixed form (prod, 2026-11-15):
-    bare digits get 400 'Invalid account number'."""
-    digits = account.strip()[-12:]
-    return f"{HUB_ACCOUNT_PREFIX}{digits}"
+    """HUB APIs (history, demand deposit, apply hold) know only the prefixed form
+    (prod, 2026-11-15): bare digits get 400 'Invalid account number'."""
+    return f"{HUB_ACCOUNT_PREFIX}{_upi_account(account)}"
 
 
 def _ack_only(instrument: Instrument, incidents: list[Incident]) -> bool:
@@ -583,7 +587,7 @@ def _enrich(s: Session, p: ComplaintProcessing, cls, instrument: Instrument,
                 continue
             ts = f"{inc.transaction_date} {inc.transaction_time}"
             resp = gateway().upi_bene_lookup(
-                rrn=inc.merchant_id, account_number=account,
+                rrn=inc.merchant_id, account_number=_upi_account(account),
                 amount=str(inc.amount), transaction_timestamp=ts,
                 ack_id=p.acknowledgement_no,
             )
@@ -860,7 +864,7 @@ def _dd_enquiry(s: Session, p: ComplaintProcessing, account: str) -> dict:
     existing = _step_get(s, p, "DD_ENQUIRY", idem)
     if existing and existing.status == "SUCCESS":
         return existing.response_payload or {}
-    resp = _account_call(lambda: gateway().demand_deposit(account))
+    resp = _account_call(lambda: gateway().demand_deposit(_hub_account(account)))
     _step_record(s, p, "DD_ENQUIRY", idem, {"account": account}, resp)
     return resp
 
@@ -930,7 +934,7 @@ def _apply_holds(s: Session, p: ComplaintProcessing, instrument: Instrument,
     # it PENDING (uncertain) and the hold is never replayed automatically.
     try:
         resp = gateway().apply_hold(
-            account_number=account, currency=currency, amount=amount_str,
+            account_number=_hub_account(account), currency=currency, amount=amount_str,
             hold_type=config.HOLD_TYPE, hold_till=config.HOLD_TILL_DATE,
             hold_narrative2=f"FRAUD {p.acknowledgement_no}"[:35],
             hold_narrative1=f"AckNo.-{p.acknowledgement_no}-MHA",
@@ -1076,7 +1080,7 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
         if not step:
             try:
                 resp = gateway().upi_bene_lookup(
-                    rrn=rrn, account_number=account, amount=str(amount),
+                    rrn=rrn, account_number=_upi_account(account), amount=str(amount),
                     transaction_timestamp=ts_iso, ack_id=p.acknowledgement_no)
                 step = _step_record(s, p, "UPI_BENE", idem, {"rrn": rrn}, resp)
             except GatewayError as e:
@@ -1093,7 +1097,10 @@ def _bene_for_rrn(s: Session, p: ComplaintProcessing, rrn: str, rtype: str,
         if not data or (step.response_payload or {}).get("invalid"):
             # cached rejection, or empty payload -> pending/ops
             return {}, rtype, "ops_review"
-        return _normalise_bene(data), "UPI", "resolved"
+        bene = _normalise_bene(data)
+        if not bene["account"]:             # UPI replied but named no payee: pending, never a blank 00
+            return {}, rtype, "ops_review"
+        return bene, "UPI", "resolved"
 
     # NEFT / RTGS -> CBDOC by LPUTRN. Include defer_count so each morning's
     # retry re-queries CBDOC instead of reusing a cached empty result.
